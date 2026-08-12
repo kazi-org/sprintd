@@ -9,6 +9,8 @@
 
 - **sprintd v0.2.1 — public repo, token-free install, predicate docs** — David Ndungu, 2026-08-12, [#3](https://github.com/kazi-org/sprintd/pull/3). Repo made public (history audited clean beforehand), so the tap's private-repository download strategy was removed and `brew install kazi-org/tap/sprintd` now needs no token or GitHub account — verified from a clean untap with every GitHub credential unset. README documents the exit-0 predicate trap, with a verified example: `govulncheck ./...` reports 13 vulnerabilities in this repo and exits 0.
 
+- **sprintd v0.3.0 — a lane can supply its own command** — David Ndungu, 2026-08-12, [#4](https://github.com/kazi-org/sprintd/pull/4). `command:` runs verbatim instead of sprintd composing `claude -p` from a `prompt:`; exactly one of the two is required, checked at parse time. Lets a lane run `kazi apply` so kazi owns convergence while sprintd supplies machine, account, deadline and watchdog. Account pinning still applies to a command lane; preflight skips its claude probes, visibly, for an all-command sprint. Additive — a prompt lane composes byte-for-byte the same command, pinned by a regression test.
+
 ## In progress
 
 _Nothing._
@@ -18,6 +20,8 @@ _Nothing._
 _Nothing._
 
 ## Planned
+
+- A `command:` lane's retry re-runs the command unchanged, because there is no prompt to append the previous failure to. If a command lane ever needs that context, passing it through an environment variable is the obvious route — deliberately not built, since the motivating case (`kazi apply`) reads the world itself.
 
 - Worktrees are never removed automatically, so a long-lived machine accumulates them. Deliberate for now (an agent may leave uncommitted work), but a `sprintd prune` that removes only worktrees whose lanes completed and whose branches are merged would be the safe version.
 - `needs` is ordering only: a dependent lane branches from base, so it sees a dependency's work only once that work lands. If dependent lanes need to build on each other directly, that needs a decision about branching from the dependency instead.
