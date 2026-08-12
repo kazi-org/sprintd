@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"syscall"
 	"time"
 
@@ -20,7 +22,12 @@ import (
 	"github.com/kazi-org/sprintd/internal/results"
 	"github.com/kazi-org/sprintd/internal/runner"
 	"github.com/kazi-org/sprintd/internal/sprint"
+	"github.com/kazi-org/sprintd/internal/status"
 )
+
+// defaultRunRoot is where run directories are created, and so where status
+// looks when it is not told which run to read.
+const defaultRunRoot = ".sprintd"
 
 // version is set at build time by the release pipeline.
 var version = "dev"
@@ -39,7 +46,7 @@ const usage = `sprintd dispatches deadline-bounded agent lanes and verifies them
 Usage:
   sprintd preflight --sprint <file>   check every machine can run lanes
   sprintd run       --sprint <file>   dispatch the sprint
-  sprintd status    --run <dir>       show the state of a run
+  sprintd status  [--run <dir>] [--json]   show the state of a run
   sprintd version                     print the version
 
 Run "sprintd <command> -h" for a command's flags.
@@ -143,10 +150,18 @@ func cmdRun(ctx context.Context, args []string) (int, error) {
 
 	dir := *runDir
 	if dir == "" {
-		dir = filepath.Join(".sprintd", fmt.Sprintf("%s-%s", s.Name, time.Now().UTC().Format("20060102T150405Z")))
+		dir = filepath.Join(defaultRunRoot, fmt.Sprintf("%s-%s", s.Name, time.Now().UTC().Format("20060102T150405Z")))
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return exitError, fmt.Errorf("creating run directory %s: %w", dir, err)
+	}
+
+	// The manifest goes down before the allocator reads usage, which shells
+	// out to ccusage and is slow: otherwise a watcher sees no manifest, and so
+	// no answer to "is this running", for the first minute of every sprint.
+	startedAt := time.Now().UTC()
+	if err := status.WriteManifest(dir, runSkeleton(s, startedAt)); err != nil {
+		log.Error("writing run manifest", "error", err)
 	}
 
 	recorder, err := results.NewRecorder(filepath.Join(dir, results.FileName))
@@ -175,6 +190,7 @@ func cmdRun(ctx context.Context, args []string) (int, error) {
 		PollInterval:     *poll,
 		PredicateTimeout: *predicateTimeout,
 		Log:              log,
+		StartedAt:        startedAt,
 	})
 	if err != nil {
 		return exitError, err
@@ -201,16 +217,63 @@ func cmdRun(ctx context.Context, args []string) (int, error) {
 	return exitOK, nil
 }
 
+// runSkeleton describes the sprint for the manifest written at run start.
+func runSkeleton(s *sprint.Sprint, startedAt time.Time) status.Manifest {
+	var machines []status.Machine
+	names := make([]string, 0, len(s.Machines))
+	for name := range s.Machines {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		machines = append(machines, status.Machine{Name: name, Host: s.Machines[name].Host})
+	}
+	var lanes []status.LaneSpec
+	for _, ln := range s.ResolvedLanes() {
+		lanes = append(lanes, status.LaneSpec{
+			ID: ln.ID, Repo: ln.Repo, Machine: ln.Machine,
+			Goal: ln.Goal, Model: ln.Model, Command: ln.Command,
+		})
+	}
+	var opened, closes *time.Time
+	if !s.Opened.IsZero() {
+		o := s.Opened
+		opened = &o
+	}
+	if !s.Closes.IsZero() {
+		c := s.Closes
+		closes = &c
+	}
+	return status.Skeleton(s.Name, opened, closes, startedAt, machines, lanes)
+}
+
 func cmdStatus(args []string) (int, error) {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
-	dir := fs.String("run", "", "run directory (required)")
+	dir := fs.String("run", "", "run directory (default: the most recent under .sprintd)")
+	asJSON := fs.Bool("json", false, "emit the machine-readable report instead of a table")
+	root := fs.String("run-root", defaultRunRoot, "where to look for the most recent run")
 	if err := fs.Parse(args); err != nil {
 		return exitError, err
 	}
-	if *dir == "" {
-		return exitError, errors.New("status: --run is required")
+
+	resolved := *dir
+	if resolved == "" {
+		found, ok, err := status.FindLatestRun(*root)
+		if err != nil {
+			return exitError, err
+		}
+		if ok {
+			resolved = found
+		}
 	}
-	recs, err := results.Load(filepath.Join(*dir, results.FileName))
+
+	if *asJSON {
+		return statusJSON(resolved)
+	}
+	if resolved == "" {
+		return exitError, errors.New("status: no run found; pass --run <dir>")
+	}
+	recs, err := results.Load(filepath.Join(resolved, results.FileName))
 	if err != nil {
 		return exitError, err
 	}
@@ -219,6 +282,27 @@ func cmdStatus(args []string) (int, error) {
 	}
 	if escalated := results.Escalated(recs); len(escalated) > 0 {
 		return exitEscalated, fmt.Errorf("%d lane(s) escalated: %v", len(escalated), escalated)
+	}
+	return exitOK, nil
+}
+
+// statusJSON emits the machine-readable report.
+//
+// The report is always written, including when there is no run at all: a
+// consumer's honest empty state depends on getting the no-run shape and exit
+// 0, not an error it has to interpret.
+func statusJSON(runDir string) (int, error) {
+	report, err := status.Build(runDir, time.Now())
+	if err != nil {
+		return exitError, err
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(report); err != nil {
+		return exitError, fmt.Errorf("writing status json: %w", err)
+	}
+	if report.Totals.Escalated > 0 {
+		return exitEscalated, nil
 	}
 	return exitOK, nil
 }
