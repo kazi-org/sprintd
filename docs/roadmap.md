@@ -23,8 +23,6 @@ _Nothing._
 
 ## Planned
 
-- A `command:` lane's retry re-runs the command unchanged, because there is no prompt to append the previous failure to. If a command lane ever needs that context, passing it through an environment variable is the obvious route — deliberately not built, since the motivating case (`kazi apply`) reads the world itself.
-
 - Worktrees are never removed automatically, so a long-lived machine accumulates them. Deliberate for now (an agent may leave uncommitted work), but a `sprintd prune` that removes only worktrees whose lanes completed and whose branches are merged would be the safe version.
 - Per-account usage is read once at the start of a run. If sprints get long enough that an account crosses its floor mid-run, re-sample between lanes.
 - `ccusage` only sees transcripts under a config dir on the local machine, so an account's usage on another host is invisible. Aggregating across the three machines would need a shared usage view.

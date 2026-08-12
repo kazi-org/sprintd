@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -321,6 +322,9 @@ func (r *Runner) ensureWorktree(ctx context.Context, ln sprint.ResolvedLane) (st
 func (r *Runner) runLane(ctx context.Context, ln sprint.ResolvedLane) laneState {
 	prompt := ln.Prompt
 	var last failure
+	// prev is nil on the first attempt; it is what a command lane reads to
+	// tell a retry from a fresh run.
+	var prev *failure
 
 	worktree, err := r.ensureWorktree(ctx, ln)
 	if err != nil {
@@ -358,7 +362,7 @@ func (r *Runner) runLane(ctx context.Context, ln sprint.ResolvedLane) laneState 
 			Worktree: worktree, Branch: gitrepo.BranchName(r.cfg.Sprint.Name, ln.ID),
 		})
 
-		outcome := r.attempt(ctx, ln, attempt, account, prompt, worktree)
+		outcome := r.attempt(ctx, ln, attempt, account, prompt, worktree, prev)
 		if outcome.complete {
 			r.record(results.Record{
 				Lane: ln.ID, State: results.StateComplete, Attempt: attempt, Repo: ln.Repo,
@@ -372,6 +376,8 @@ func (r *Runner) runLane(ctx context.Context, ln sprint.ResolvedLane) laneState 
 		}
 
 		last = outcome.failure
+		failed := outcome.failure
+		prev = &failed
 		r.recordFailure(ln, attempt, account, worktree, outcome)
 
 		if attempt == ln.Attempts {
@@ -456,7 +462,7 @@ type attemptOutcome struct {
 }
 
 // attempt runs the lane once and, if the process exits cleanly, verifies it.
-func (r *Runner) attempt(ctx context.Context, ln sprint.ResolvedLane, attempt int, account, prompt, worktree string) attemptOutcome {
+func (r *Runner) attempt(ctx context.Context, ln sprint.ResolvedLane, attempt int, account, prompt, worktree string, prev *failure) attemptOutcome {
 	logPath := filepath.Join(r.cfg.RunDir, "logs", fmt.Sprintf("%s.attempt-%d.log", ln.ID, attempt))
 	logFile, err := os.Create(logPath)
 	if err != nil {
@@ -464,7 +470,10 @@ func (r *Runner) attempt(ctx context.Context, ln sprint.ResolvedLane, attempt in
 	}
 	defer logFile.Close()
 
-	env := map[string]string{}
+	env := map[string]string{EnvAttempt: strconv.Itoa(attempt)}
+	if prev != nil {
+		env[EnvLastFailure] = lastFailureEnv(*prev)
+	}
 	if acct, ok := r.cfg.Allocator.Account(account); ok && acct.ConfigDir != "" {
 		// This is how Claude Code separates credentials, so it is how a lane
 		// is pinned to one account.

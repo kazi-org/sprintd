@@ -229,3 +229,33 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+// TestRemoteScriptEnvSurvivesTheShell covers the ssh path, where environment
+// is applied by exporting it inside a remote shell rather than through
+// cmd.Env. Lane context is multi-line and contains quotes and shell
+// metacharacters, so a naive export would corrupt it or break the script.
+func TestRemoteScriptEnvSurvivesTheShell(t *testing.T) {
+	t.Parallel()
+
+	value := "predicate failed: it's broken\n\nFAIL: $(whoami) saw `2` prompts\nexpected 1"
+	script := machine.RemoteScript(machine.Command{
+		Env:    map[string]string{"SPRINTD_LAST_FAILURE": value},
+		Script: `printf %s "$SPRINTD_LAST_FAILURE"`,
+	})
+
+	// Run the generated remote script locally: this is exactly what ssh would
+	// hand to bash on the far side.
+	var out strings.Builder
+	res, err := machine.NewExecutor().Run(context.Background(), machine.Command{
+		Host: machine.LocalHost, Script: script,
+	}, &out)
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	if !res.OK() {
+		t.Fatalf("Run() result = %+v, want a clean exit", res)
+	}
+	if out.String() != value {
+		t.Errorf("environment did not survive the remote shell:\n got %q\nwant %q", out.String(), value)
+	}
+}
