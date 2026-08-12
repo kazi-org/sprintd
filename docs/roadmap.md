@@ -15,6 +15,8 @@
 
 - **sprintd v0.4.0 — a retried command is told why the last attempt failed** — David Ndungu, 2026-08-12, [#6](https://github.com/kazi-org/sprintd/pull/6). `SPRINTD_ATTEMPT` on every dispatch and `SPRINTD_LAST_FAILURE` on attempts after the first, carrying the failure reason and the predicate's output, bounded, reason line kept whole. Closes the parity gap where a `command:` lane re-ran identically and burned a deadline (and dispatched-agent quota) per retry to reproduce a known failure. Covers the ssh path, where the multi-line value travels through a remote shell.
 
+- **sprintd v0.5.0 — `status --json`, the machine-readable interface** — David Ndungu, 2026-08-12, [#7](https://github.com/kazi-org/sprintd/pull/7) and [#8](https://github.com/kazi-org/sprintd/pull/8). Versioned JSON report so a dashboard never parses `results.jsonl`. Runs write `run.json` at start (before the slow ccusage sample) and finalise it at end, which is what makes an explicit running / finished / interrupted answer possible. Machines report busy or idle with no fabricated utilisation figure; account usage carries `sampled_at` and `sampled_once`. No run at all exits 0 with a `no_run` shape. A log truncated by a kill mid-write drops only its final line and says so.
+
 ## In progress
 
 _Nothing._
