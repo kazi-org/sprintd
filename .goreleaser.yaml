@@ -37,7 +37,10 @@ archives:
     files:
       - README.md
       - LICENSE
-      - examples/**/*
+      # Single star: goreleaser's globber does not expand ** here, and a glob
+      # that matches nothing is only a warning, so the archives would silently
+      # ship without the example sprint file and launchd plist.
+      - examples/*
 
 checksum:
   name_template: checksums.txt
