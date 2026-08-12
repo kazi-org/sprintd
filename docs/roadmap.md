@@ -11,6 +11,8 @@
 
 - **sprintd v0.3.0 — a lane can supply its own command** — David Ndungu, 2026-08-12, [#4](https://github.com/kazi-org/sprintd/pull/4). `command:` runs verbatim instead of sprintd composing `claude -p` from a `prompt:`; exactly one of the two is required, checked at parse time. Lets a lane run `kazi apply` so kazi owns convergence while sprintd supplies machine, account, deadline and watchdog. Account pinning still applies to a command lane; preflight skips its claude probes, visibly, for an all-command sprint. Additive — a prompt lane composes byte-for-byte the same command, pinned by a regression test.
 
+- **`needs` semantics recorded and guarded** — David Ndungu, 2026-08-12, [#5](https://github.com/kazi-org/sprintd/pull/5). Docs, example and one test; no release. Ordering-only semantics documented in the README with the deep-chain anti-pattern called out, moved out of Planned into Decided, the example rewritten to show genuine ordering instead of inheritance, and a test that goes red against the rejected branch-from-dependency design.
+
 ## In progress
 
 _Nothing._
