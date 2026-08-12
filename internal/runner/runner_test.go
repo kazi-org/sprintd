@@ -378,8 +378,11 @@ func TestStalledLaneIsKilledAndRequeued(t *testing.T) {
 	})
 
 	// A deadline far longer than the stall window, so a stall is the only
-	// thing that can kill attempt one.
-	h := newHarness(t, fixture(t, lane("L1", "deadline: 30s")), exec, nil)
+	// thing that can kill attempt one. The watchdog is opt-in for prompt
+	// lanes, so this asks for it explicitly.
+	h := newHarness(t, fixture(t, lane("L1", "deadline: 30s")), exec, func(c *Config) {
+		c.StallComposed = true
+	})
 	sum, err := h.runner.Run(context.Background())
 	if err != nil {
 		t.Fatalf("Run() error = %v, want nil", err)
@@ -1269,4 +1272,165 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// TestPromptLaneIsNotWatchedForStallsByDefault is the fix for a defect that
+// would have failed most real lanes.
+//
+// `claude -p` in its default text output mode writes nothing while it works --
+// measured at 69% of a short run spent completely silent, and proportionally
+// far worse on a long one. Killing on silence there turns healthy lanes into
+// escalations, and the retry is identically silent, so the lane can never
+// converge. See docs/testing.md.
+func TestPromptLaneIsNotWatchedForStallsByDefault(t *testing.T) {
+	t.Parallel()
+
+	exec := newFakeExec(func(ctx context.Context, c call, _ int, out io.Writer) (machine.Result, error) {
+		if c.Predicate {
+			fmt.Fprintln(out, "OK")
+			return machine.Result{ExitCode: 0}, nil
+		}
+		// Work silently for longer than the stall window, as a real agent does.
+		select {
+		case <-ctx.Done():
+			return machine.Result{ExitCode: -1, Killed: true}, nil
+		case <-time.After(120 * time.Millisecond):
+		}
+		fmt.Fprintln(out, "finished thinking")
+		return machine.Result{ExitCode: 0}, nil
+	})
+
+	h := newHarness(t, fixture(t, lane("L1", "deadline: 30s")), exec, func(c *Config) {
+		c.Stall = 20 * time.Millisecond
+		c.PollInterval = 5 * time.Millisecond
+	})
+	sum, err := h.runner.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	if len(sum.Complete) != 1 {
+		t.Fatalf("Complete = %v, want [L1]: a silent prompt lane is working, not stalled", sum.Complete)
+	}
+	want := []results.State{results.StateDispatched, results.StateComplete}
+	if got := states(h.recorder.records(t), "L1"); !equalStates(got, want) {
+		t.Errorf("L1 transitions = %v, want %v", got, want)
+	}
+}
+
+// TestCommandLaneIsStillWatched keeps the watchdog where silence really is a
+// symptom: a command that supplies its own output.
+func TestCommandLaneIsStillWatched(t *testing.T) {
+	t.Parallel()
+
+	exec := newFakeExec(func(ctx context.Context, c call, attempt int, out io.Writer) (machine.Result, error) {
+		if c.Predicate {
+			fmt.Fprintln(out, "OK")
+			return machine.Result{ExitCode: 0}, nil
+		}
+		if attempt == 1 {
+			<-ctx.Done()
+			return machine.Result{ExitCode: -1, Killed: true}, nil
+		}
+		fmt.Fprintln(out, "working")
+		return machine.Result{ExitCode: 0}, nil
+	})
+
+	h := newHarness(t, fixture(t, commandLane("L1", "kazi apply goals/lane=L1.toml")), exec, func(c *Config) {
+		c.Stall = 30 * time.Millisecond
+		c.PollInterval = 5 * time.Millisecond
+	})
+	if _, err := h.runner.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	got := states(h.recorder.records(t), "L1")
+	want := []results.State{
+		results.StateDispatched, results.StateStalled, results.StateKilled,
+		results.StateRequeued, results.StateDispatched, results.StateComplete,
+	}
+	if !equalStates(got, want) {
+		t.Errorf("L1 transitions = %v, want %v: command lanes do stream, so silence is a symptom", got, want)
+	}
+}
+
+func TestStallPolicy(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		stall          time.Duration
+		composed       bool
+		wantPrompt     bool
+		wantCommand    bool
+		wantSubstrings []string
+	}{
+		{
+			name: "default watches command lanes only", stall: 10 * time.Minute,
+			wantCommand: true,
+			wantSubstrings: []string{"command lanes only", "off for prompt lanes",
+				"no output while working", "Deadlines still apply"},
+		},
+		{
+			name: "explicit opt-in watches everything", stall: 10 * time.Minute, composed: true,
+			wantPrompt: true, wantCommand: true,
+			wantSubstrings: []string{"on all lanes"},
+		},
+		{
+			name: "zero disables it everywhere", stall: 0,
+			wantSubstrings: []string{"disabled for all lanes", "deadlines still apply"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := fixture(t, lane("L1"))
+			h := newHarness(t, s, newFakeExec(succeed), func(c *Config) {
+				c.Stall = tc.stall
+				c.StallComposed = tc.composed
+			})
+			policy := h.runner.StallPolicy()
+			if policy.PromptLanes != tc.wantPrompt {
+				t.Errorf("PromptLanes = %v, want %v", policy.PromptLanes, tc.wantPrompt)
+			}
+			if policy.CommandLanes != tc.wantCommand {
+				t.Errorf("CommandLanes = %v, want %v", policy.CommandLanes, tc.wantCommand)
+			}
+			for _, want := range tc.wantSubstrings {
+				if !strings.Contains(policy.String(), want) {
+					t.Errorf("String() = %q, want it to mention %q", policy.String(), want)
+				}
+			}
+		})
+	}
+}
+
+// TestHeartbeatsSurviveADisabledWatchdog keeps liveness observable even where
+// silence is not treated as a symptom.
+func TestHeartbeatsSurviveADisabledWatchdog(t *testing.T) {
+	t.Parallel()
+
+	exec := newFakeExec(func(ctx context.Context, c call, _ int, out io.Writer) (machine.Result, error) {
+		if c.Predicate {
+			fmt.Fprintln(out, "OK")
+			return machine.Result{ExitCode: 0}, nil
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(40 * time.Millisecond):
+		}
+		return machine.Result{ExitCode: 0}, nil
+	})
+
+	dir := t.TempDir()
+	h := newHarness(t, fixture(t, lane("L1", "deadline: 30s")), exec, func(c *Config) {
+		c.RunDir = dir
+		c.Stall = 0
+		c.PollInterval = 5 * time.Millisecond
+	})
+	if _, err := h.runner.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	if _, err := readFile(dir + "/heartbeats/L1.json"); err != nil {
+		t.Errorf("heartbeat missing with the watchdog off: %v", err)
+	}
 }

@@ -122,7 +122,7 @@ being behind is expected.
 |------|---------|---------|
 | `--sprint` | required | path to the sprint file |
 | `--run-dir` | `.sprintd/<sprint>-<timestamp>` | where logs, heartbeats and results go |
-| `--stall` | `10m` | kill a lane that produces no output for this long |
+| `--stall` | `10m` | kill a lane that produces no output for this long; passing it explicitly also applies it to `prompt` lanes |
 | `--predicate-timeout` | `10m` | bound on a single predicate run |
 | `--poll` | `5s` | how often the watchdog samples lane activity |
 | `--force` | off | dispatch even if preflight fails |
@@ -360,10 +360,58 @@ that should not start until an earlier one has been dealt with — and keep the
 chains shallow. If two pieces of work truly build on each other, they are
 usually one lane.
 
-**Watchdog.** A lane that writes nothing for `--stall` is killed. A lane that
-runs past its deadline is killed. Either way the reason is attached to the next
-attempt's prompt, and the lane is requeued. When `retries` runs out the lane
-becomes `escalated` with its last failure output preserved.
+**Watchdog.** A lane that runs past its deadline is killed. A lane that writes
+nothing for `--stall` is killed **only where silence means something** — see
+below. Either way the reason is attached to the next attempt, and the lane is
+requeued. When `retries` runs out the lane becomes `escalated` with its last
+failure output preserved.
+
+### Why the stall watchdog is off for `prompt` lanes
+
+`claude -p` defaults to `--output-format text`, and only `stream-json` is
+realtime. So a lane whose command sprintd composes **produces no output while
+it is working** and writes its result at the end. Measured on a single small
+task:
+
+```
+t= 4s    157 bytes     <- a small early write
+   …                    <- nine seconds of complete silence
+t=13s    848 bytes     <- everything else, then exit
+```
+
+69% of that run was silent, and the silent fraction grows with the length of
+the task. Killing a lane for producing no output would therefore be killing it
+for behaving normally — and because the retry is identically silent, the lane
+could never converge: it would stall, requeue, stall again, exhaust its retries
+and escalate, spending the whole budget on healthy work.
+
+So:
+
+| Lane | Stall watchdog |
+|---|---|
+| `prompt` | **off** by default — pass `--stall` explicitly to turn it on |
+| `command` | **on** — such commands do stream, so silence is a symptom |
+
+**This is not "unbounded".** Every lane is still bounded by its `deadline`, and
+killing it still reaps the child's whole process group, so nothing survives its
+lane. The watchdog only shortens the wait when a lane is genuinely wedged.
+
+`sprintd run` prints the policy in effect at start, because a safety mechanism
+that is off should be visibly off:
+
+```
+level=INFO msg="watchdog policy" policy="stall watchdog 10m0s on command lanes only;
+off for prompt lanes, which produce no output while working (pass --stall to
+override). Deadlines still apply to every lane"
+```
+
+Heartbeat files are written either way — liveness is worth observing even where
+silence is not a symptom.
+
+The measurement, and the standing rule it produced, are in
+[`docs/testing.md`](docs/testing.md). Dispatching composed lanes with
+`--output-format stream-json` would make silence mean what the watchdog assumes;
+until then the safe default is not to guess.
 
 **Verification.** See the predicate discipline above.
 
@@ -629,6 +677,12 @@ go test -race ./...
 go vet ./...
 goreleaser release --snapshot --clean
 ```
+
+[`docs/testing.md`](docs/testing.md) carries the testing rules, including the
+one that matters most here: anything modelling an external binary's behaviour
+gets verified against that binary at least once, and the measurement is
+recorded. Two shipped defects came from fakes that encoded an unchecked
+assumption.
 
 ## License
 

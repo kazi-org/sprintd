@@ -115,7 +115,8 @@ func cmdRun(ctx context.Context, args []string) (int, error) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	path := fs.String("sprint", "", "path to the sprint file (required)")
 	runDir := fs.String("run-dir", "", "directory for logs and results (default .sprintd/<sprint>-<timestamp>)")
-	stall := fs.Duration("stall", runner.DefaultStall, "kill a lane that produces no output for this long")
+	stall := fs.Duration("stall", runner.DefaultStall,
+		"kill a lane that produces no output for this long; passing it explicitly also applies it to prompt lanes")
 	predicateTimeout := fs.Duration("predicate-timeout", runner.DefaultPredicateTimeout, "bound on a single predicate run")
 	poll := fs.Duration("poll", runner.DefaultPollInterval, "how often the watchdog samples lane activity")
 	force := fs.Bool("force", false, "dispatch even if preflight fails")
@@ -124,6 +125,14 @@ func cmdRun(ctx context.Context, args []string) (int, error) {
 	if err := fs.Parse(args); err != nil {
 		return exitError, err
 	}
+	// An explicitly passed --stall is the operator saying they want the
+	// watchdog on prompt lanes too, where it is otherwise off by default.
+	stallExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "stall" {
+			stallExplicit = true
+		}
+	})
 	if *path == "" {
 		return exitError, errors.New("run: --sprint is required")
 	}
@@ -191,11 +200,14 @@ func cmdRun(ctx context.Context, args []string) (int, error) {
 		PredicateTimeout: *predicateTimeout,
 		Log:              log,
 		StartedAt:        startedAt,
+		StallComposed:    stallExplicit,
 	})
 	if err != nil {
 		return exitError, err
 	}
 
+	// A safety mechanism that is off has to be visibly off.
+	log.Info("watchdog policy", "policy", r.StallPolicy().String())
 	log.Info("dispatching sprint", "sprint", s.Name, "lanes", len(s.Lanes), "run_dir", dir)
 	summary, err := r.Run(ctx)
 	if err != nil {
