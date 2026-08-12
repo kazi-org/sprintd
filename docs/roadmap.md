@@ -17,6 +17,8 @@
 
 - **sprintd v0.5.0 — `status --json`, the machine-readable interface** — David Ndungu, 2026-08-12, [#7](https://github.com/kazi-org/sprintd/pull/7) and [#8](https://github.com/kazi-org/sprintd/pull/8). Versioned JSON report so a dashboard never parses `results.jsonl`. Runs write `run.json` at start (before the slow ccusage sample) and finalise it at end, which is what makes an explicit running / finished / interrupted answer possible. Machines report busy or idle with no fabricated utilisation figure; account usage carries `sampled_at` and `sampled_once`. No run at all exits 0 with a `no_run` shape. A log truncated by a kill mid-write drops only its final line and says so.
 
+- **sprintd v0.6.0 — the stall watchdog stops killing healthy lanes** — David Ndungu, 2026-08-12, [#9](https://github.com/kazi-org/sprintd/pull/9). `claude -p` writes nothing while working (measured: 69% of a short task silent, reproduced independently at 71%), so the 10-minute stall default was killing normal lanes, requeueing them into identical silence and escalating them on healthy work. Watchdog is now off by default for `prompt` lanes, on for `command` lanes, opt-in via explicit `--stall`; deadlines and process-group kill still bound everything, and the policy is logged at run start. Adds `docs/testing.md` with the measurement and the rule it produced.
+
 ## In progress
 
 _Nothing._
@@ -26,6 +28,8 @@ _Nothing._
 _Nothing._
 
 ## Planned
+
+- **Option 1 for the watchdog: dispatch composed lanes with `--output-format stream-json --verbose`**, which makes silence mean what the watchdog assumes and lets it come back on for prompt lanes. Needs a plan agreed first: the lane log becomes JSON lines, so a human reading an escalated lane needs a legible view, and `SPRINTD_LAST_FAILURE` plus the composed retry context must carry readable failure text rather than raw envelopes. Verify against the real binary including a lane that thinks for several minutes.
 
 - Worktrees are never removed automatically, so a long-lived machine accumulates them. Deliberate for now (an agent may leave uncommitted work), but a `sprintd prune` that removes only worktrees whose lanes completed and whose branches are merged would be the safe version.
 - Per-account usage is read once at the start of a run. If sprints get long enough that an account crosses its floor mid-run, re-sample between lanes.
