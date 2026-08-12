@@ -171,7 +171,7 @@ lanes:
     model: opus                       # optional; overrides defaults
     deadline: 90m                     # optional; overrides defaults
     retries: 1                        # optional; overrides defaults
-    needs: [L0]                       # lanes that must complete first
+    needs: [L0]                       # ordering only — see "How lanes run"
 
   - id: L2
     repo: app
@@ -274,10 +274,8 @@ Three consequences worth knowing:
   path such as `cd ~/Code/org/app && ./scripts/check.sh` escapes the worktree
   and verifies the wrong tree — it would pass or fail on code the lane never
   touched.
-- **`needs` is ordering, not code inheritance.** A dependent lane branches from
-  the base like any other, so it sees its dependency's work only once that work
-  has landed on the base. The base is re-fetched when each lane's worktree is
-  created, so a dependency merged mid-sprint is picked up.
+- **`needs` is ordering, not code inheritance** — see below. A dependent lane
+  branches from the base like any other.
 - **Worktrees are never removed automatically.** An agent may have left
   uncommitted work in one, and an escalated lane's tree is exactly the one
   someone will want to read. Their paths and branches are recorded in
@@ -295,8 +293,40 @@ The scarce resource is mergeable changes in one repo, not CPU or memory, so
 there is deliberately no load-based throttling.
 
 **Ordering.** A lane waits for every id in its `needs`. If one of them
-escalates, the dependent escalates too rather than running against a
-foundation that was never laid.
+escalates, the dependent escalates too rather than running against a foundation
+that was never laid.
+
+### `needs` is ordering, not code inheritance
+
+This is the one thing about `needs` that surprises people, so it is worth being
+blunt about.
+
+A lane with `needs` waits for its dependencies to complete, and then **branches
+from the repo's `base` like every other lane**. It does not branch from its
+dependency. So it sees a dependency's work only once that work has **landed on
+the base** — not merely once the dependency's predicate passed.
+
+The base is re-fetched when each lane's worktree is created, so a dependency
+merged part-way through a sprint *is* picked up by a lane that starts after the
+merge.
+
+If you are wondering why your dependent lane cannot see the fix the lane before
+it made: that is why. The fix is on a `sprintd/<sprint>/<lane>` branch, and
+nothing has merged it.
+
+This is deliberate. It matches how CI works, and "merged to the base" is a
+stronger signal of completion than "the predicate passed" — a lane whose
+predicate passed but whose work was never reviewed or merged has not really
+finished, and a dependent built on top of it would be building on something
+nobody accepted.
+
+**The consequence: deep `needs` chains are an anti-pattern in a sprint file.**
+A chain of dependent lanes stalls unless each link merges to the base before
+the next one starts, and sprintd does not merge anything. Prefer independent
+lanes. Use `needs` for genuine ordering — work that must not overlap, or a lane
+that should not start until an earlier one has been dealt with — and keep the
+chains shallow. If two pieces of work truly build on each other, they are
+usually one lane.
 
 **Watchdog.** A lane that writes nothing for `--stall` is killed. A lane that
 runs past its deadline is killed. Either way the reason is attached to the next
