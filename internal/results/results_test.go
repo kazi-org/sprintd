@@ -212,3 +212,48 @@ func TestReadSkipsBlankLinesAndReportsBadOnes(t *testing.T) {
 		t.Errorf("Read() error = %v, want it to name the line number", err)
 	}
 }
+
+func TestReadTolerantDropsOnlyATruncatedFinalLine(t *testing.T) {
+	t.Parallel()
+
+	// The exact shape a kill mid-write leaves: two complete records, and a
+	// third cut off partway through its own Write call.
+	truncated := `{"lane":"L1","state":"complete"}
+{"lane":"L2","state":"dispatched"}
+{"lane":"L3","state":"disp`
+	recs, wasTruncated, err := results.ReadTolerant(strings.NewReader(truncated))
+	if err != nil {
+		t.Fatalf("ReadTolerant() error = %v, want nil: a partial final line must not fail the read", err)
+	}
+	if !wasTruncated {
+		t.Error("ReadTolerant() truncated = false, want true")
+	}
+	if len(recs) != 2 {
+		t.Fatalf("ReadTolerant() returned %d records, want the 2 complete ones", len(recs))
+	}
+	if recs[0].Lane != "L1" || recs[1].Lane != "L2" {
+		t.Errorf("ReadTolerant() = %+v, want L1 then L2 in order", recs)
+	}
+
+	// A malformed line that is NOT the last one is real corruption, not a
+	// partial write, and must still fail.
+	corrupt := `{not json}
+{"lane":"L2","state":"complete"}
+`
+	if _, _, err := results.ReadTolerant(strings.NewReader(corrupt)); err == nil {
+		t.Error("ReadTolerant() error = nil, want an error: corruption in the middle of the file is not a partial write")
+	}
+
+	clean := `{"lane":"L1","state":"complete"}
+`
+	recs, wasTruncated, err = results.ReadTolerant(strings.NewReader(clean))
+	if err != nil {
+		t.Fatalf("ReadTolerant() error = %v, want nil", err)
+	}
+	if wasTruncated {
+		t.Error("ReadTolerant() truncated = true, want false: every line here is well-formed")
+	}
+	if len(recs) != 1 {
+		t.Errorf("ReadTolerant() returned %d records, want 1", len(recs))
+	}
+}

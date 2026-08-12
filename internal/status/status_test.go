@@ -498,6 +498,58 @@ func equalSnapshots(a, b map[string]fileState) bool {
 	return true
 }
 
+// TestTruncatedEventLog covers a run killed exactly mid-write to
+// results.jsonl: the founder-facing requirement is that this reports what is
+// known rather than failing to parse.
+func TestTruncatedEventLog(t *testing.T) {
+	t.Parallel()
+
+	m := baseManifest()
+	m.PID = 0 // unreachable pid: the process is gone, same as a real kill
+	dir := writeRun(t, &m, nil)
+
+	raw := `{"time":"2026-08-12T11:00:10Z","sprint":"demo","lane":"L1","state":"dispatched","attempt":1,"machine":"mini"}
+{"time":"2026-08-12T11:10:00Z","sprint":"demo","lane":"L1","state":"complete","attempt":1,"machine":"mini"}
+{"time":"2026-08-12T11:00:12Z","sprint":"demo","lane":"L2","state":"disp`
+	if err := os.WriteFile(filepath.Join(dir, results.FileName), []byte(raw), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	got, err := status.Build(dir, now)
+	if err != nil {
+		t.Fatalf("Build() error = %v, want nil: a truncated event log must still report", err)
+	}
+	if got.Status == status.StatusRunning {
+		t.Fatalf("Status = %q, want anything but running: the process is gone", got.Status)
+	}
+	var l1, l2 status.Lane
+	for _, lane := range got.Lanes {
+		switch lane.ID {
+		case "L1":
+			l1 = lane
+		case "L2":
+			l2 = lane
+		}
+	}
+	if l1.State != "complete" {
+		t.Errorf("L1 state = %q, want complete: both its records were intact", l1.State)
+	}
+	// L2's only record was the truncated one, dropped as incomplete; it must
+	// fall back to declared-but-unresolved, not a phantom dispatched state.
+	if l2.State != "pending" || l2.DispatchedAt != nil {
+		t.Errorf("L2 = %+v, want pending: its only event was the truncated line", l2)
+	}
+	var sawNote bool
+	for _, note := range got.Notes {
+		if strings.Contains(note, "incomplete") {
+			sawNote = true
+		}
+	}
+	if !sawNote {
+		t.Error("no note explained that the log's last line was dropped as incomplete")
+	}
+}
+
 // TestEscalatedBeforeDispatchIsNotCountedAsDispatched covers the real case
 // where a lane reaches a terminal state without ever running: its dependency
 // escalated, or no account was eligible. It must not inflate the dispatched
