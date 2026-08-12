@@ -24,9 +24,14 @@ _Nothing._
 - A `command:` lane's retry re-runs the command unchanged, because there is no prompt to append the previous failure to. If a command lane ever needs that context, passing it through an environment variable is the obvious route — deliberately not built, since the motivating case (`kazi apply`) reads the world itself.
 
 - Worktrees are never removed automatically, so a long-lived machine accumulates them. Deliberate for now (an agent may leave uncommitted work), but a `sprintd prune` that removes only worktrees whose lanes completed and whose branches are merged would be the safe version.
-- `needs` is ordering only: a dependent lane branches from base, so it sees a dependency's work only once that work lands. If dependent lanes need to build on each other directly, that needs a decision about branching from the dependency instead.
 - Per-account usage is read once at the start of a run. If sprints get long enough that an account crosses its floor mid-run, re-sample between lanes.
 - `ccusage` only sees transcripts under a config dir on the local machine, so an account's usage on another host is invisible. Aggregating across the three machines would need a shared usage view.
+
+## Decided
+
+Behaviours that were questioned and ruled on. They are settled, not pending — do not rebuild them the other way without reopening the decision.
+
+- **`needs` is ordering only; dependent lanes branch from the base.** 2026-08-12. A lane with `needs` waits for its dependencies to complete, but still branches from the repo's `base` like any other lane, so it sees a dependency's work only once that work has **landed on the base** — not merely when the dependency's predicate passed. Branching a dependent from its dependency's branch was considered and rejected. Rationale: it matches how CI works, and "merged to base" is a stronger completion signal than "the predicate passed" — a lane whose predicate passed but whose work was never reviewed or merged has not really finished. Accepted cost: a chain of dependent lanes stalls unless each one merges, so sprint files should prefer independent lanes and avoid deep `needs` chains. Documented in the README under "How lanes run".
 
 ## Blocked
 

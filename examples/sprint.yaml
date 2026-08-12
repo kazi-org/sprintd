@@ -101,14 +101,22 @@ lanes:
     predicate: "./scripts/payments-stable.sh"
     machine: builder
 
+  # needs is ORDERING, not code inheritance. L3 branches from base like every
+  # other lane, so it would see L1's work only once L1 had merged to base --
+  # sprintd merges nothing. So do not use needs to build on an earlier lane's
+  # code. Use it for work that genuinely must not overlap: here, both lanes
+  # drive the same simulator, and running them at once would make each one's
+  # results meaningless.
+  #
+  # Keep such chains shallow. See "needs is ordering, not code inheritance" in
+  # the README.
   - id: L3
     repo: app
-    goal: "The release build ships with the fixed launch path"
+    goal: "Onboarding has no dead ends on a fresh install"
     prompt: >
-      Cut a release build and confirm it boots clean.
-    # needs is ordering, not code inheritance: L3 branches from base like any
-    # other lane, so it sees L1's work only once L1 has landed on the base.
-    predicate: "./scripts/release-smoke.sh"
+      Walk the onboarding flow on a freshly installed simulator build and fix
+      any screen that cannot be advanced or dismissed.
+    predicate: "./scripts/onboarding-walk.sh"
     machine: mini
     needs: [L1]
     retries: 1

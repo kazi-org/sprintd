@@ -1077,3 +1077,45 @@ func TestCommandLaneRetriesVerbatim(t *testing.T) {
 		t.Error("the predicate failure was not preserved in results.jsonl")
 	}
 }
+
+// TestDependentLaneBranchesFromBaseNotItsDependency pins a ratified decision:
+// needs is ordering only. A dependent lane branches from the repo's base like
+// every other lane, so it sees its dependency's work only once that work has
+// merged to the base -- "merged" being a stronger completion signal than "the
+// predicate passed". Branching a dependent from its dependency's branch was
+// considered and rejected; this test is what stops it being rebuilt that way
+// by accident.
+func TestDependentLaneBranchesFromBaseNotItsDependency(t *testing.T) {
+	t.Parallel()
+
+	exec := newFakeExec(succeed)
+	s := fixture(t, lane("L1")+lane("L2", "needs: [L1]"))
+	h := newHarness(t, s, exec, nil)
+	if _, err := h.runner.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+
+	base := machine.Quote(sprint.DefaultBase)
+	dependencyBranch := gitrepo.BranchName("test", "L1")
+
+	var setups int
+	for _, c := range exec.snapshot() {
+		if !c.Setup {
+			continue
+		}
+		setups++
+		if !strings.Contains(c.Script, base) {
+			t.Errorf("worktree setup did not branch from the repo base %s:\n%s", base, c.Script)
+		}
+		if strings.Contains(c.Script, dependencyBranch+"'") && strings.Contains(c.Script, "worktree add") {
+			// The dependency's branch may legitimately appear as the -B target
+			// of L1's own setup, but never as the base another lane forks off.
+			if strings.Contains(c.Script, "-B "+machine.Quote(gitrepo.BranchName("test", "L2"))) {
+				t.Errorf("L2 was branched from its dependency's branch, not the base:\n%s", c.Script)
+			}
+		}
+	}
+	if setups != 2 {
+		t.Fatalf("worktree setups = %d, want one per lane", setups)
+	}
+}
