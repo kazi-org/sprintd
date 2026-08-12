@@ -38,15 +38,13 @@ predicate is not a lane.
 brew install kazi-org/tap/sprintd
 ```
 
+No token or GitHub account is needed.
+
 Or build from source:
 
 ```sh
 go build -o sprintd .
 ```
-
-> The tap formula downloads release assets from this repository. While the
-> repository is private, `brew` needs a GitHub token with access to it:
-> `export HOMEBREW_GITHUB_API_TOKEN=$(gh auth token)` before installing.
 
 ## Commands
 
@@ -241,6 +239,85 @@ becomes `escalated` with its last failure output preserved.
 
 **Verification.** See the predicate discipline above.
 
+## Writing predicates that actually fail
+
+**sprintd passes a predicate on exit 0 and nothing else.** It does not read the
+predicate's output, and it has no verdict modes. That keeps the contract to one
+command, but it puts one obligation on you: **the predicate script decides the
+verdict itself and exits non-zero. Never trust the exit code of the tool it
+wraps.**
+
+Plenty of tools report problems and still exit 0. That is not hypothetical —
+here is this repository, scanned by a tool many people would wrap directly:
+
+```console
+$ govulncheck ./... ; echo "exit=$?"
+Your code is affected by 0 vulnerabilities.
+This scan also found 1 vulnerability in packages you import and 12
+vulnerabilities in modules you require, but your code doesn't appear to call
+these vulnerabilities.
+exit=0
+```
+
+Thirteen reported vulnerabilities, exit 0. A lane dispatched to deal with them
+whose predicate is the bare command would be marked **complete** with every one
+of them still there — the exact false completion this tool exists to prevent,
+reintroduced through a predicate its author believed was safe.
+
+Wrong:
+
+```yaml
+predicate: "govulncheck ./..."
+```
+
+Right — the wrapper inspects the findings and decides:
+
+```yaml
+predicate: "./scripts/no-vulns.sh"
+```
+
+```sh
+#!/bin/bash
+# Exit non-zero if the scan reports anything at all, whatever the tool's own
+# exit code says.
+set -euo pipefail
+found=$(govulncheck -format json ./... | grep -c '"osv"' || true)
+if [ "$found" -gt 0 ]; then
+  echo "FAIL: govulncheck reported $found vulnerability records"
+  exit 1
+fi
+echo "OK: no vulnerability records"
+```
+
+Know the shape so you recognise it. `trivy` exits 0 on findings unless you pass
+`--exit-code`; `grype` exits 0 unless you pass `--fail-on`; `govulncheck` exits
+0 in `-format json` mode regardless, and, as above, also exits 0 in its default
+mode for vulnerabilities your code does not call. Linters, coverage tools and
+report generators behave the same way.
+
+The reliable habit: **run your predicate by hand against a known-broken tree
+before you put it in a sprint file, and confirm it exits non-zero.** A
+predicate that has never failed has never been tested.
+
+### If you need more than exit 0
+
+Some checks want more than a single exit code — structured evidence, flake
+tolerance, guards against a lane satisfying the letter of a check, or a loop
+that converges rather than a one-shot verdict. sprintd deliberately does not
+grow those; it stays a scheduler with a one-command contract.
+
+Point the predicate at something that does. Because a predicate is just a
+command, a lane can invoke [kazi](https://github.com/kazi-org/kazi), a
+reconciliation controller built around exactly that problem, with no change to
+either tool:
+
+```yaml
+predicate: "kazi status --goal faceid-cold-launch --exit-code"
+```
+
+sprintd still decides completion the same way — by that command's exit status,
+observed from outside the lane.
+
 ## Account allocation
 
 sprintd reads per-account usage by shelling out to
@@ -260,6 +337,19 @@ at each account's directory.
   hard stop cannot be enforced in that state, and the log says so.
 - If every account is exhausted, the lane escalates with that reason. It is
   never silently dispatched anyway.
+
+**Before a multi-account sprint can run, each account's `config_dir` has to
+exist and be logged in once.** A `CLAUDE_CONFIG_DIR` is just a directory;
+pointing at an empty one does not create an account. Run `claude` once per
+directory and complete the login:
+
+```sh
+CLAUDE_CONFIG_DIR=~/.claude-secondary claude   # then /login
+```
+
+Skip this and lanes pinned to that account fail on the first dispatch.
+Preflight catches it — that is what its per-account `claude -p` probe is for —
+but it is worth doing before you ever get there.
 
 Two limits are worth knowing. Usage is sampled once at the start of a run, not
 before every lane — a sprint is minutes to hours long and the floor protects a
