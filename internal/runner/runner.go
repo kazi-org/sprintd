@@ -54,6 +54,16 @@ type Config struct {
 	Recorder  *results.Recorder
 	// Stall is how long a lane may produce no output before it is killed.
 	Stall time.Duration
+	// StallComposed applies the stall watchdog to lanes whose command sprintd
+	// composes from a prompt.
+	//
+	// It is off unless the operator explicitly asks for it, because
+	// `claude -p` in its default text output mode writes nothing while it
+	// works -- so silence is normal behaviour there, not a symptom, and
+	// killing on it converts healthy lanes into escalations. A lane that
+	// supplies its own command is watched as usual, since such commands do
+	// stream. See docs/testing.md for the measurement.
+	StallComposed bool
 	// PollInterval is how often the watchdog samples lane activity.
 	PollInterval time.Duration
 	// PredicateTimeout bounds a single predicate run.
@@ -87,6 +97,54 @@ func (r *Runner) repoLock(repo string) *sync.Mutex {
 	return lock.(*sync.Mutex)
 }
 
+// StallPolicy is which lanes the stall watchdog applies to, so an operator can
+// see that a safety mechanism is off rather than assume it is on.
+type StallPolicy struct {
+	Stall        time.Duration
+	PromptLanes  bool
+	CommandLanes bool
+}
+
+// String renders the policy for a log line.
+func (p StallPolicy) String() string {
+	if p.Stall <= 0 {
+		return "stall watchdog disabled for all lanes; deadlines still apply"
+	}
+	switch {
+	case p.PromptLanes && p.CommandLanes:
+		return fmt.Sprintf("stall watchdog %s on all lanes", p.Stall)
+	case p.CommandLanes:
+		return fmt.Sprintf("stall watchdog %s on command lanes only; "+
+			"off for prompt lanes, which produce no output while working "+
+			"(pass --stall to override). Deadlines still apply to every lane", p.Stall)
+	case p.PromptLanes:
+		return fmt.Sprintf("stall watchdog %s on prompt lanes only", p.Stall)
+	default:
+		return "stall watchdog disabled for all lanes; deadlines still apply"
+	}
+}
+
+// StallPolicy reports the watchdog policy in effect.
+func (r *Runner) StallPolicy() StallPolicy {
+	return StallPolicy{
+		Stall:        r.cfg.Stall,
+		PromptLanes:  r.cfg.Stall > 0 && r.cfg.StallComposed,
+		CommandLanes: r.cfg.Stall > 0,
+	}
+}
+
+// stallFor is the watchdog window for one lane, or zero when it does not
+// apply.
+func (r *Runner) stallFor(ln sprint.ResolvedLane) time.Duration {
+	if r.cfg.Stall <= 0 {
+		return 0
+	}
+	if ln.Composed() && !r.cfg.StallComposed {
+		return 0
+	}
+	return r.cfg.Stall
+}
+
 // Summary reports how a sprint ended.
 type Summary struct {
 	Complete  []string
@@ -110,8 +168,8 @@ func New(cfg Config) (*Runner, error) {
 	if cfg.RunDir == "" {
 		return nil, errors.New("building runner: run directory is empty")
 	}
-	if cfg.Stall <= 0 {
-		cfg.Stall = DefaultStall
+	if cfg.Stall < 0 {
+		cfg.Stall = 0
 	}
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = DefaultPollInterval
@@ -586,7 +644,7 @@ func (r *Runner) attempt(ctx context.Context, ln sprint.ResolvedLane, attempt in
 	defer cancelDeadline()
 
 	writer := newActivityWriter(logFile, r.cfg.Now)
-	stopWatchdog := r.watch(laneCtx, ln, attempt, writer, cancelCause)
+	stopWatchdog := r.watch(laneCtx, ln, attempt, writer, cancelCause, r.stallFor(ln))
 
 	start := r.cfg.Now()
 	res, runErr := r.cfg.Exec.Run(laneCtx, cmd, writer)
@@ -600,7 +658,7 @@ func (r *Runner) attempt(ctx context.Context, ln sprint.ResolvedLane, attempt in
 	case errors.Is(cause, errStalled):
 		out.failure = failure{
 			Kind:   failStall,
-			Detail: fmt.Sprintf("no output for %s", r.cfg.Stall),
+			Detail: fmt.Sprintf("no output for %s", r.stallFor(ln)),
 			Output: tailOfFile(logPath, maxContextBytes),
 		}
 		return out
@@ -684,6 +742,7 @@ func (r *Runner) watch(
 	attempt int,
 	writer *activityWriter,
 	cancelCause context.CancelCauseFunc,
+	stall time.Duration,
 ) (stop func()) {
 	done := make(chan struct{})
 	finished := make(chan struct{})
@@ -700,8 +759,10 @@ func (r *Runner) watch(
 			case <-ticker.C:
 				now := r.cfg.Now()
 				idle := writer.IdleFor(now)
+				// Heartbeats are written whatever the stall policy: liveness
+				// is worth observing even where silence is not a symptom.
 				r.writeHeartbeat(ln, attempt, writer, now, idle)
-				if idle >= r.cfg.Stall {
+				if stall > 0 && idle >= stall {
 					r.cfg.Log.Warn("lane stalled; killing",
 						"lane", ln.ID, "attempt", attempt, "idle", idle.Round(time.Second))
 					cancelCause(errStalled)
