@@ -63,8 +63,25 @@ func (s *scriptedExec) Run(_ context.Context, cmd machine.Command, out io.Writer
 		fmt.Fprint(out, r.output)
 		return machine.Result{ExitCode: r.exit}, nil
 	}
+	if strings.Contains(cmd.Script, "rev-parse") {
+		fmt.Fprint(out, healthyCheckout)
+		return machine.Result{ExitCode: 0}, nil
+	}
 	fmt.Fprint(out, "sprintd-ok")
 	return machine.Result{ExitCode: 0}, nil
+}
+
+// healthyCheckout is what the status probe prints for a tree sitting exactly
+// on its base.
+const healthyCheckout = "branch=main\nbase=ok\nbehind=0\nahead=0\nancestor=yes\n"
+
+// checkoutOutput renders the probe output for an arbitrary position.
+func checkoutOutput(branch string, behind, ahead int, ancestor bool) string {
+	yn := "no"
+	if ancestor {
+		yn = "yes"
+	}
+	return fmt.Sprintf("branch=%s\nbase=ok\nbehind=%d\nahead=%d\nancestor=%s\n", branch, behind, ahead, yn)
 }
 
 func (s *scriptedExec) scripts() []string {
@@ -104,7 +121,7 @@ func TestAllChecksPass(t *testing.T) {
 	for _, want := range []string{
 		"echo sprintd-ok",
 		"test -d '/srv/app'/.git",
-		"git fetch --dry-run",
+		"git fetch",
 		"claude --version",
 		"claude -p ",
 	} {
@@ -163,7 +180,7 @@ func TestFailingChecksAreReported(t *testing.T) {
 		{
 			name:       "git fetch cannot authenticate",
 			rule:       rule{match: "git fetch", exit: 128, output: "fatal: could not read from remote"},
-			wantDetail: "exit 128",
+			wantDetail: "could not read from remote",
 		},
 		{
 			name:       "claude is not installed",
@@ -274,6 +291,136 @@ func TestRender(t *testing.T) {
 	for _, want := range []string{"MACHINE", "mini", "dgx", "FAIL", "pass", "machines ready:"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("Render() output missing %q; got:\n%s", want, text)
+		}
+	}
+}
+
+// TestStaleCheckoutFailsPreflight is the neglected-checkout case. A tree far
+// behind its base feeds lanes stale source and stale CI config while every
+// lane reports success, so preflight fails rather than warns.
+func TestStaleCheckoutFailsPreflight(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		checkout   string
+		wantOK     bool
+		wantDetail []string
+	}{
+		{
+			name:     "exactly on the base",
+			checkout: checkoutOutput("main", 0, 0, true),
+			wantOK:   true,
+		},
+		{
+			name:     "a little behind is tolerated",
+			checkout: checkoutOutput("main", 10, 0, true),
+			wantOK:   true,
+		},
+		{
+			name:     "at the threshold is tolerated",
+			checkout: checkoutOutput("main", 50, 0, true),
+			wantOK:   true,
+		},
+		{
+			name:       "past the threshold fails",
+			checkout:   checkoutOutput("main", 51, 0, true),
+			wantDetail: []string{"51 behind", "origin/main", "more than 50 behind"},
+		},
+		{
+			name:       "the real neglected checkout fails with its numbers",
+			checkout:   checkoutOutput("develop", 1550, 433, false),
+			wantDetail: []string{"develop", "1550 behind", "433 ahead", "not an ancestor"},
+		},
+		{
+			name:       "a diverged but current branch still fails",
+			checkout:   checkoutOutput("wip", 0, 7, false),
+			wantDetail: []string{"wip", "7 ahead", "commits the base does not"},
+		},
+		{
+			name:       "an unfetched base fails",
+			checkout:   "branch=main\nbase=missing\n",
+			wantDetail: []string{"origin/main", "does not exist"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			exec := &scriptedExec{rules: []rule{
+				{match: "rev-parse", output: tc.checkout},
+				{match: "claude --version", output: "2.1.0"},
+			}}
+			reports := preflight.Run(context.Background(), load(t), exec, preflight.Options{})
+			if got := preflight.AllOK(reports); got != tc.wantOK {
+				t.Fatalf("AllOK() = %v, want %v", got, tc.wantOK)
+			}
+			if tc.wantOK {
+				return
+			}
+			var detail string
+			for _, r := range reports {
+				for _, c := range r.Checks {
+					if !c.OK && strings.HasPrefix(c.Name, "checkout") {
+						detail = c.Detail
+					}
+				}
+			}
+			for _, want := range tc.wantDetail {
+				if !strings.Contains(detail, want) {
+					t.Errorf("checkout failure detail = %q, want it to contain %q", detail, want)
+				}
+			}
+		})
+	}
+}
+
+// TestStaleThresholdIsPerRepo checks the sprint file can loosen or tighten the
+// gate for one repo.
+func TestStaleThresholdIsPerRepo(t *testing.T) {
+	t.Parallel()
+
+	src := strings.Replace(sprintFile,
+		"app: { path: /srv/app, max_concurrent: 2 }",
+		"app: { path: /srv/app, max_concurrent: 2, base: origin/trunk, stale_threshold: 2000 }", 1)
+	s, err := sprint.Parse([]byte(src))
+	if err != nil {
+		t.Fatalf("parsing sprint: %v", err)
+	}
+
+	exec := &scriptedExec{rules: []rule{
+		{match: "rev-parse", output: checkoutOutput("develop", 1550, 0, true)},
+		{match: "claude --version", output: "2.1.0"},
+	}}
+	reports := preflight.Run(context.Background(), s, exec, preflight.Options{})
+	if !preflight.AllOK(reports) {
+		t.Fatalf("AllOK() = false, want true: 1550 behind is under the repo's 2000 threshold; reports = %+v", reports)
+	}
+	joined := strings.Join(exec.scripts(), "\n")
+	if !strings.Contains(joined, "origin/trunk") {
+		t.Errorf("probe did not use the repo's declared base; ran:\n%s", joined)
+	}
+}
+
+// TestMissingRepoSkipsFreshnessChecks avoids reporting a confusing git error
+// on top of the real problem.
+func TestMissingRepoSkipsFreshnessChecks(t *testing.T) {
+	t.Parallel()
+
+	exec := &scriptedExec{rules: []rule{
+		{match: "test -d", exit: 1},
+		{match: "claude --version", output: "2.1.0"},
+	}}
+	reports := preflight.Run(context.Background(), load(t), exec, preflight.Options{})
+	if preflight.AllOK(reports) {
+		t.Fatal("AllOK() = true, want false")
+	}
+	for _, r := range reports {
+		for _, c := range r.Checks {
+			if strings.HasPrefix(c.Name, "checkout ") || strings.HasPrefix(c.Name, "git fetch ") {
+				t.Errorf("ran %q against a repo that is not there", c.Name)
+			}
 		}
 	}
 }

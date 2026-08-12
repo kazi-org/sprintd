@@ -48,6 +48,11 @@ type Record struct {
 	Model   string    `json:"model,omitempty"`
 	// Reason explains a non-complete transition in one line.
 	Reason string `json:"reason,omitempty"`
+	// Worktree is the tree the lane ran in, and Branch the branch it was
+	// checked out on. Both are recorded so the work an escalated lane left
+	// behind can be found without guessing.
+	Worktree string `json:"worktree,omitempty"`
+	Branch   string `json:"branch,omitempty"`
 	// ExitCode is the dispatched process's status where one exists.
 	ExitCode *int `json:"exit_code,omitempty"`
 	// PredicateOutput is the predicate's combined output, preserved on every

@@ -12,9 +12,11 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/kazi-org/sprintd/internal/allocator"
+	"github.com/kazi-org/sprintd/internal/gitrepo"
 	"github.com/kazi-org/sprintd/internal/machine"
 	"github.com/kazi-org/sprintd/internal/results"
 	"github.com/kazi-org/sprintd/internal/sprint"
@@ -62,6 +64,18 @@ type Config struct {
 // Runner executes one sprint.
 type Runner struct {
 	cfg Config
+	// repoLocks serialises the repo-mutating half of lane setup. Concurrent
+	// lanes in one repo would otherwise run git fetch and git worktree add at
+	// the same time and collide on the repo's ref and index locks.
+	repoLocks sync.Map
+	// worktrees caches each lane's prepared tree so a retry continues in the
+	// tree the previous attempt left rather than starting over.
+	worktrees sync.Map
+}
+
+func (r *Runner) repoLock(repo string) *sync.Mutex {
+	lock, _ := r.repoLocks.LoadOrStore(repo, &sync.Mutex{})
+	return lock.(*sync.Mutex)
 }
 
 // Summary reports how a sprint ended.
@@ -270,11 +284,53 @@ func (r *Runner) summarise(lanes []sprint.ResolvedLane, state map[string]laneSta
 	return sum
 }
 
+// ensureWorktree gives the lane its own working tree, branched from a freshly
+// fetched base, and returns its path.
+//
+// Every lane gets one. Without it a repo's max_concurrent above 1 is not
+// merely risky but incoherent: concurrent lanes would share one working tree,
+// one index and one checked-out branch, and silently overwrite each other. It
+// also means the primary checkout's own branch and staleness cannot reach a
+// lane, since the lane never runs in it.
+func (r *Runner) ensureWorktree(ctx context.Context, ln sprint.ResolvedLane) (string, error) {
+	if cached, ok := r.worktrees.Load(ln.ID); ok {
+		return cached.(string), nil
+	}
+	worktree := gitrepo.WorktreePath(ln.RepoPath, r.cfg.Sprint.Name, ln.ID)
+	branch := gitrepo.BranchName(r.cfg.Sprint.Name, ln.ID)
+
+	lock := r.repoLock(ln.Repo)
+	lock.Lock()
+	defer lock.Unlock()
+	if cached, ok := r.worktrees.Load(ln.ID); ok {
+		return cached.(string), nil
+	}
+
+	created, err := gitrepo.EnsureWorktree(ctx, r.cfg.Exec, ln.Host, ln.RepoPath, worktree, branch, ln.Base)
+	if err != nil {
+		return "", err
+	}
+	r.cfg.Log.Info("lane worktree ready", "lane", ln.ID, "path", worktree,
+		"branch", branch, "base", ln.Base, "created", created)
+	r.worktrees.Store(ln.ID, worktree)
+	return worktree, nil
+}
+
 // runLane dispatches one lane, retrying until it verifies or runs out of
 // attempts.
 func (r *Runner) runLane(ctx context.Context, ln sprint.ResolvedLane) laneState {
 	prompt := ln.Prompt
 	var last failure
+
+	worktree, err := r.ensureWorktree(ctx, ln)
+	if err != nil {
+		r.record(results.Record{
+			Lane: ln.ID, State: results.StateEscalated, Attempt: 0, Repo: ln.Repo,
+			Machine: ln.Machine, Model: ln.Model,
+			Reason: fmt.Sprintf("could not prepare a worktree from %s: %v", ln.Base, err),
+		})
+		return laneEscalated
+	}
 
 	for attempt := 1; attempt <= ln.Attempts; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -299,9 +355,10 @@ func (r *Runner) runLane(ctx context.Context, ln sprint.ResolvedLane) laneState 
 		r.record(results.Record{
 			Lane: ln.ID, State: results.StateDispatched, Attempt: attempt, Repo: ln.Repo,
 			Machine: ln.Machine, Account: account, Model: ln.Model, Reason: ln.Goal,
+			Worktree: worktree, Branch: gitrepo.BranchName(r.cfg.Sprint.Name, ln.ID),
 		})
 
-		outcome := r.attempt(ctx, ln, attempt, account, prompt)
+		outcome := r.attempt(ctx, ln, attempt, account, prompt, worktree)
 		if outcome.complete {
 			r.record(results.Record{
 				Lane: ln.ID, State: results.StateComplete, Attempt: attempt, Repo: ln.Repo,
@@ -309,12 +366,13 @@ func (r *Runner) runLane(ctx context.Context, ln sprint.ResolvedLane) laneState 
 				ExitCode: outcome.exitCode, PredicateOutput: outcome.predicateOutput,
 				DurationMS: outcome.duration.Milliseconds(),
 				Reason:     "predicate passed",
+				Worktree:   worktree, Branch: gitrepo.BranchName(r.cfg.Sprint.Name, ln.ID),
 			})
 			return laneComplete
 		}
 
 		last = outcome.failure
-		r.recordFailure(ln, attempt, account, outcome)
+		r.recordFailure(ln, attempt, account, worktree, outcome)
 
 		if attempt == ln.Attempts {
 			break
@@ -332,16 +390,20 @@ func (r *Runner) runLane(ctx context.Context, ln sprint.ResolvedLane) laneState 
 		Machine: ln.Machine, Model: ln.Model,
 		Reason:          fmt.Sprintf("%d attempts exhausted; last failure: %s", ln.Attempts, last),
 		PredicateOutput: last.Output,
+		// The tree is left in place: someone is going to want to read what
+		// this lane actually did.
+		Worktree: worktree, Branch: gitrepo.BranchName(r.cfg.Sprint.Name, ln.ID),
 	})
 	return laneEscalated
 }
 
 // recordFailure writes the transitions that describe one failed attempt.
-func (r *Runner) recordFailure(ln sprint.ResolvedLane, attempt int, account string, o attemptOutcome) {
+func (r *Runner) recordFailure(ln sprint.ResolvedLane, attempt int, account, worktree string, o attemptOutcome) {
 	base := results.Record{
 		Lane: ln.ID, Attempt: attempt, Repo: ln.Repo, Machine: ln.Machine,
 		Account: account, Model: ln.Model, ExitCode: o.exitCode,
 		DurationMS: o.duration.Milliseconds(), Reason: o.failure.String(),
+		Worktree: worktree, Branch: gitrepo.BranchName(r.cfg.Sprint.Name, ln.ID),
 	}
 	switch o.failure.Kind {
 	case failStall:
@@ -376,7 +438,7 @@ type attemptOutcome struct {
 }
 
 // attempt runs the lane once and, if the process exits cleanly, verifies it.
-func (r *Runner) attempt(ctx context.Context, ln sprint.ResolvedLane, attempt int, account, prompt string) attemptOutcome {
+func (r *Runner) attempt(ctx context.Context, ln sprint.ResolvedLane, attempt int, account, prompt, worktree string) attemptOutcome {
 	logPath := filepath.Join(r.cfg.RunDir, "logs", fmt.Sprintf("%s.attempt-%d.log", ln.ID, attempt))
 	logFile, err := os.Create(logPath)
 	if err != nil {
@@ -393,8 +455,9 @@ func (r *Runner) attempt(ctx context.Context, ln sprint.ResolvedLane, attempt in
 
 	cmd := machine.Command{
 		Host: ln.Host,
-		Dir:  ln.RepoPath,
-		Env:  env,
+		// The lane's own worktree, never the primary checkout.
+		Dir: worktree,
+		Env: env,
 		Script: fmt.Sprintf("claude -p %s --model %s",
 			machine.Quote(prompt), machine.Quote(ln.Model)),
 	}
@@ -452,7 +515,7 @@ func (r *Runner) attempt(ctx context.Context, ln sprint.ResolvedLane, attempt in
 
 	// The process exited cleanly. That is not completion. Completion is the
 	// predicate passing, observed by a process that did none of the work.
-	predOut, predOK := r.verify(ctx, ln)
+	predOut, predOK := r.verify(ctx, ln, worktree)
 	out.predicateOutput = predOut
 	if predOK {
 		out.complete = true
@@ -468,16 +531,19 @@ func (r *Runner) attempt(ctx context.Context, ln sprint.ResolvedLane, attempt in
 
 // verify runs the lane's acceptance predicate as its own process and returns
 // its combined output.
-func (r *Runner) verify(ctx context.Context, ln sprint.ResolvedLane) (string, bool) {
+func (r *Runner) verify(ctx context.Context, ln sprint.ResolvedLane, worktree string) (string, bool) {
 	ctx, cancel := context.WithTimeout(ctx, r.cfg.PredicateTimeout)
 	defer cancel()
 
 	var buf bytes.Buffer
 	// No account environment is applied: the predicate is a check, not agent
 	// work, and must not consume the quota it is meant to protect.
+	// The predicate runs in the lane's worktree, so it judges the work the
+	// lane actually did. A predicate written with an absolute path into the
+	// primary checkout would escape it and verify the wrong tree.
 	res, err := r.cfg.Exec.Run(ctx, machine.Command{
 		Host:   ln.Host,
-		Dir:    ln.RepoPath,
+		Dir:    worktree,
 		Script: ln.Predicate,
 	}, &buf)
 	output := tailBytes(buf.String(), maxContextBytes)

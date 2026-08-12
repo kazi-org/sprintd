@@ -193,6 +193,23 @@ func TestParseRejects(t *testing.T) {
 			wantSub: "sprint name is empty",
 		},
 		{
+			name: "negative stale threshold",
+			mutate: func(s string) string {
+				return strings.Replace(s, "max_concurrent: 4", "max_concurrent: 4, stale_threshold: -1", 1)
+			},
+			wantSub: "repo app has stale_threshold -1",
+		},
+		{
+			name:    "lane id that cannot be a branch name",
+			mutate:  func(s string) string { return strings.Replace(s, "id: L1", `id: "L 1"`, 1) },
+			wantSub: "lane id \"L 1\" is not usable in a branch name",
+		},
+		{
+			name:    "sprint name that cannot be a branch name",
+			mutate:  func(s string) string { return strings.Replace(s, "sprint: demo", "sprint: my demo", 1) },
+			wantSub: "sprint name \"my demo\" is not usable in a branch name",
+		},
+		{
 			name:    "unknown field",
 			mutate:  func(s string) string { return strings.Replace(s, "sprint: demo", "sprint: demo\nmystery: 1", 1) },
 			wantSub: "field mystery not found",
@@ -249,11 +266,21 @@ func TestMachineRepos(t *testing.T) {
 		t.Fatalf("Parse() error = %v, want nil", err)
 	}
 	got := s.MachineRepos()
-	if len(got["mini"]) != 1 || got["mini"][0] != "/srv/app" {
-		t.Errorf("MachineRepos()[mini] = %v, want [/srv/app]", got["mini"])
-	}
-	if len(got["dgx"]) != 1 || got["dgx"][0] != "/srv/app" {
-		t.Errorf("MachineRepos()[dgx] = %v, want [/srv/app]", got["dgx"])
+	for _, name := range []string{"mini", "dgx"} {
+		targets := got[name]
+		if len(targets) != 1 {
+			t.Fatalf("MachineRepos()[%s] = %v, want one repo", name, targets)
+		}
+		if targets[0].Path != "/srv/app" || targets[0].Name != "app" {
+			t.Errorf("MachineRepos()[%s][0] = %+v, want repo app at /srv/app", name, targets[0])
+		}
+		if targets[0].Base != sprint.DefaultBase {
+			t.Errorf("base = %q, want the default %q", targets[0].Base, sprint.DefaultBase)
+		}
+		if targets[0].StaleThreshold != sprint.DefaultStaleThreshold {
+			t.Errorf("stale threshold = %d, want the default %d",
+				targets[0].StaleThreshold, sprint.DefaultStaleThreshold)
+		}
 	}
 }
 
@@ -275,4 +302,58 @@ func cutBlock(s, start, end string) string {
 		}
 	}
 	return strings.Join(out, "\n")
+}
+
+func TestRepoBaseAndStaleDefaults(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		repoLine      string
+		wantBase      string
+		wantThreshold int
+	}{
+		{
+			name:          "unset takes the defaults",
+			repoLine:      "app:  { path: /srv/app, max_concurrent: 4 }",
+			wantBase:      sprint.DefaultBase,
+			wantThreshold: sprint.DefaultStaleThreshold,
+		},
+		{
+			name:          "declared values win",
+			repoLine:      "app:  { path: /srv/app, max_concurrent: 4, base: origin/trunk, stale_threshold: 5 }",
+			wantBase:      "origin/trunk",
+			wantThreshold: 5,
+		},
+		{
+			// Zero has to survive: it means the checkout must be exactly
+			// current, which is a legitimate thing to demand.
+			name:          "an explicit zero threshold is not treated as unset",
+			repoLine:      "app:  { path: /srv/app, max_concurrent: 4, stale_threshold: 0 }",
+			wantBase:      sprint.DefaultBase,
+			wantThreshold: 0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := strings.Replace(validSprint, "app:  { path: /srv/app, max_concurrent: 4 }", tc.repoLine, 1)
+			s, err := sprint.Parse([]byte(src))
+			if err != nil {
+				t.Fatalf("Parse() error = %v, want nil", err)
+			}
+			repo := s.Repos["app"]
+			if got := repo.BaseRef(); got != tc.wantBase {
+				t.Errorf("BaseRef() = %q, want %q", got, tc.wantBase)
+			}
+			if got := repo.StaleLimit(); got != tc.wantThreshold {
+				t.Errorf("StaleLimit() = %d, want %d", got, tc.wantThreshold)
+			}
+			if got := s.ResolvedLanes()[0].Base; got != tc.wantBase {
+				t.Errorf("resolved lane base = %q, want %q", got, tc.wantBase)
+			}
+		})
+	}
 }

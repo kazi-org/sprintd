@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/kazi-org/sprintd/internal/allocator"
+	"github.com/kazi-org/sprintd/internal/gitrepo"
 	"github.com/kazi-org/sprintd/internal/machine"
 	"github.com/kazi-org/sprintd/internal/results"
 	"github.com/kazi-org/sprintd/internal/sprint"
@@ -20,8 +21,10 @@ import (
 type call struct {
 	Lane      string
 	Script    string
+	Dir       string
 	Env       map[string]string
 	Predicate bool
+	Setup     bool
 }
 
 // fakeExec records every command and answers according to handler.
@@ -32,6 +35,8 @@ type fakeExec struct {
 	// dispatches counts prior dispatches of each lane, so a handler can make
 	// attempt N behave differently from attempt N+1.
 	dispatches map[string]int
+	// failWorktree, when set, makes worktree setup fail with this message.
+	failWorktree string
 }
 
 func newFakeExec(h func(ctx context.Context, c call, attempt int, out io.Writer) (machine.Result, error)) *fakeExec {
@@ -39,8 +44,23 @@ func newFakeExec(h func(ctx context.Context, c call, attempt int, out io.Writer)
 }
 
 func (f *fakeExec) Run(ctx context.Context, cmd machine.Command, out io.Writer) (machine.Result, error) {
+	// Lane setup is answered here rather than by the handler: every lane needs
+	// a worktree before it can be dispatched, and no test is about that.
+	if strings.Contains(cmd.Script, "git worktree add") {
+		f.mu.Lock()
+		f.calls = append(f.calls, call{Script: cmd.Script, Setup: true, Dir: cmd.Dir})
+		fail := f.failWorktree
+		f.mu.Unlock()
+		if fail != "" {
+			fmt.Fprintln(out, fail)
+			return machine.Result{ExitCode: 128}, nil
+		}
+		fmt.Fprintln(out, "worktree=created")
+		return machine.Result{ExitCode: 0}, nil
+	}
+
 	isPredicate := !strings.HasPrefix(cmd.Script, "claude -p ")
-	c := call{Script: cmd.Script, Env: cmd.Env, Predicate: isPredicate}
+	c := call{Script: cmd.Script, Env: cmd.Env, Predicate: isPredicate, Dir: cmd.Dir}
 	c.Lane = laneFromScript(cmd.Script)
 
 	f.mu.Lock()
@@ -223,7 +243,7 @@ func TestLaneCompletesOnlyWhenPredicatePasses(t *testing.T) {
 	// The predicate must have been a separate command, not the lane's own run.
 	var sawPredicate bool
 	for _, c := range h.exec.snapshot() {
-		if c.Predicate && c.Script == "verify lane=L1" {
+		if c.Predicate && !c.Setup && c.Script == "verify lane=L1" {
 			sawPredicate = true
 		}
 	}
@@ -305,7 +325,7 @@ func TestRequeueCarriesFailureContext(t *testing.T) {
 
 	var dispatches []string
 	for _, c := range h.exec.snapshot() {
-		if !c.Predicate {
+		if !c.Predicate && !c.Setup {
 			dispatches = append(dispatches, c.Script)
 		}
 	}
@@ -366,7 +386,7 @@ func TestStalledLaneIsKilledAndRequeued(t *testing.T) {
 		t.Errorf("L1 transitions = %v, want %v", got, want)
 	}
 	for _, c := range h.exec.snapshot() {
-		if !c.Predicate && strings.Contains(c.Script, "no output for") {
+		if !c.Predicate && !c.Setup && strings.Contains(c.Script, "no output for") {
 			return
 		}
 	}
@@ -599,6 +619,9 @@ func TestAccountIsPinnedViaConfigDir(t *testing.T) {
 		t.Fatalf("Run() error = %v, want nil", err)
 	}
 	for _, c := range exec.snapshot() {
+		if c.Setup {
+			continue
+		}
 		if c.Predicate {
 			if _, ok := c.Env["CLAUDE_CONFIG_DIR"]; ok {
 				t.Error("predicate was given account credentials; it must not consume the quota it protects")
@@ -724,4 +747,167 @@ func equalStates(got, want []results.State) bool {
 		}
 	}
 	return true
+}
+
+// TestLaneRunsInItsOwnWorktree pins the property that makes a per-repo
+// concurrency cap above 1 coherent at all, and that keeps the primary
+// checkout's branch and staleness away from the lane.
+func TestLaneRunsInItsOwnWorktree(t *testing.T) {
+	t.Parallel()
+
+	exec := newFakeExec(succeed)
+	s := fixture(t, lane("L1")+lane("L2"))
+	h := newHarness(t, s, exec, nil)
+	if _, err := h.runner.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+
+	dirs := map[string]map[string]bool{}
+	for _, c := range exec.snapshot() {
+		if c.Setup {
+			if c.Dir != "/srv/app" {
+				t.Errorf("worktree setup ran in %q, want the repo /srv/app", c.Dir)
+			}
+			continue
+		}
+		if dirs[c.Lane] == nil {
+			dirs[c.Lane] = map[string]bool{}
+		}
+		dirs[c.Lane][c.Dir] = true
+	}
+
+	for _, id := range []string{"L1", "L2"} {
+		want := gitrepo.WorktreePath("/srv/app", "test", id)
+		got := dirs[id]
+		if len(got) != 1 || !got[want] {
+			t.Errorf("lane %s ran in %v, want only its own worktree %s", id, keys(got), want)
+		}
+	}
+	if a, b := gitrepo.WorktreePath("/srv/app", "test", "L1"), gitrepo.WorktreePath("/srv/app", "test", "L2"); a == b {
+		t.Fatal("two lanes resolved to the same worktree")
+	}
+}
+
+// TestPredicateRunsInTheLanesWorktree guards the trap that a predicate must
+// judge the tree the lane actually worked in.
+func TestPredicateRunsInTheLanesWorktree(t *testing.T) {
+	t.Parallel()
+
+	exec := newFakeExec(succeed)
+	h := newHarness(t, fixture(t, lane("L1")), exec, nil)
+	if _, err := h.runner.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	want := gitrepo.WorktreePath("/srv/app", "test", "L1")
+	var checked bool
+	for _, c := range exec.snapshot() {
+		if c.Setup || !c.Predicate {
+			continue
+		}
+		checked = true
+		if c.Dir != want {
+			t.Errorf("predicate ran in %q, want the lane worktree %q", c.Dir, want)
+		}
+	}
+	if !checked {
+		t.Fatal("no predicate ran")
+	}
+}
+
+// TestWorktreeIsPreparedOncePerLane keeps a retry in the tree the previous
+// attempt left, rather than discarding its progress.
+func TestWorktreeIsPreparedOncePerLane(t *testing.T) {
+	t.Parallel()
+
+	exec := newFakeExec(func(_ context.Context, c call, attempt int, out io.Writer) (machine.Result, error) {
+		if c.Predicate {
+			if attempt == 1 {
+				fmt.Fprintln(out, "not yet")
+				return machine.Result{ExitCode: 1}, nil
+			}
+			fmt.Fprintln(out, "OK")
+			return machine.Result{ExitCode: 0}, nil
+		}
+		fmt.Fprintln(out, "working")
+		return machine.Result{ExitCode: 0}, nil
+	})
+	h := newHarness(t, fixture(t, lane("L1")), exec, nil)
+	if _, err := h.runner.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+
+	setups, dispatches := 0, 0
+	for _, c := range exec.snapshot() {
+		switch {
+		case c.Setup:
+			setups++
+		case !c.Predicate:
+			dispatches++
+		}
+	}
+	if dispatches != 2 {
+		t.Fatalf("dispatches = %d, want 2", dispatches)
+	}
+	if setups != 1 {
+		t.Errorf("worktree setups = %d, want 1: a retry must continue in the same tree", setups)
+	}
+}
+
+// TestWorktreeFailureEscalatesWithoutDispatching keeps a lane from silently
+// running in the primary checkout when its worktree could not be made.
+func TestWorktreeFailureEscalatesWithoutDispatching(t *testing.T) {
+	t.Parallel()
+
+	exec := newFakeExec(func(_ context.Context, c call, _ int, _ io.Writer) (machine.Result, error) {
+		t.Errorf("lane work ran despite no worktree: %q", c.Script)
+		return machine.Result{ExitCode: 0}, nil
+	})
+	exec.failWorktree = "fatal: invalid reference: origin/main"
+
+	h := newHarness(t, fixture(t, lane("L1")), exec, nil)
+	sum, err := h.runner.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	if len(sum.Escalated) != 1 || sum.Escalated[0] != "L1" {
+		t.Fatalf("Escalated = %v, want [L1]", sum.Escalated)
+	}
+	reason := terminalRecord(t, h.recorder.records(t), "L1").Reason
+	if !strings.Contains(reason, "worktree") || !strings.Contains(reason, "origin/main") {
+		t.Errorf("escalation reason = %q, want it to name the worktree and the base", reason)
+	}
+}
+
+// TestConcurrentLanesGetDistinctWorktrees is the collision case: four lanes in
+// one repo must not share a working tree.
+func TestConcurrentLanesGetDistinctWorktrees(t *testing.T) {
+	t.Parallel()
+
+	exec := newFakeExec(succeed)
+	s := fixture(t, lane("L1")+lane("L2")+lane("L3")+lane("L4"))
+	h := newHarness(t, s, exec, nil)
+	if _, err := h.runner.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	seen := map[string]string{}
+	for _, c := range exec.snapshot() {
+		if c.Setup || c.Predicate {
+			continue
+		}
+		if prev, ok := seen[c.Dir]; ok && prev != c.Lane {
+			t.Errorf("lanes %s and %s shared working tree %s", prev, c.Lane, c.Dir)
+		}
+		seen[c.Dir] = c.Lane
+	}
+	if len(seen) != 4 {
+		t.Errorf("distinct working trees = %d, want 4", len(seen))
+	}
+}
+
+func keys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }

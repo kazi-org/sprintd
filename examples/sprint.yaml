@@ -46,13 +46,23 @@ accounts:
 
 repos:
   # max_concurrent caps lanes per repo, because the scarce resource is
-  # mergeable changes in one checkout, not CPU.
+  # mergeable changes in one repo, not CPU. Each lane still gets its own git
+  # worktree, so concurrent lanes never share a working tree.
+  #
+  # base is what every lane branches from, after a fresh fetch. It is also what
+  # preflight measures the checkout against: a tree more than stale_threshold
+  # commits behind it, or carrying commits it does not have, fails preflight
+  # rather than quietly feeding lanes stale source.
   app:
     path: ~/Code/example-org/app
     max_concurrent: 4
+    base: origin/main       # default
+    stale_threshold: 50     # default
   service:
     path: ~/Code/example-org/service
     max_concurrent: 2
+    # A repo whose default branch is not main names it here.
+    base: origin/master
 
 lanes:
   - id: L1
@@ -62,6 +72,8 @@ lanes:
       On a cold launch the app shows the biometric prompt twice. Find the
       cause and fix it. The check at scripts/cold-launch-check.sh must exit
       zero when you are done; run it yourself before you finish.
+    # Predicates are relative to the repo root: they run inside the lane's
+    # own worktree. An absolute path would escape it and verify the wrong tree.
     predicate: "./scripts/cold-launch-check.sh"
     machine: mini
     model: opus
@@ -82,7 +94,8 @@ lanes:
     goal: "The release build ships with the fixed launch path"
     prompt: >
       Cut a release build and confirm it boots clean.
-      Do not start until L1 has landed.
+    # needs is ordering, not code inheritance: L3 branches from base like any
+    # other lane, so it sees L1's work only once L1 has landed on the base.
     predicate: "./scripts/release-smoke.sh"
     machine: mini
     needs: [L1]

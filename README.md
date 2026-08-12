@@ -78,8 +78,7 @@ Checks every machine any lane targets, in parallel, inside a per-machine budget
 1. the machine is reachable (`ssh` with `BatchMode`, so a password prompt is a
    failure rather than a hang),
 2. each repo path exists and is a git checkout,
-3. `git fetch --dry-run` works there, which exercises network and credentials
-   without writing refs,
+3. `git fetch` works there, and the checkout is actually usable — see below,
 4. `claude --version` runs,
 5. a trivial `claude -p` returns the expected string — once per account that
    has its own `config_dir`, since that is what separates credentials.
@@ -87,6 +86,29 @@ Checks every machine any lane targets, in parallel, inside a per-machine budget
 Step 5 is graded on the output, not just the exit status. An agent that exits
 `0` and says nothing is the locked-keychain shape, and it is exactly what
 would otherwise burn twenty lanes' worth of deadline doing nothing.
+
+#### The checkout gate
+
+**A repo path in a sprint file is not necessarily a usable checkout.** After
+fetching, preflight reports where the tree sits relative to the repo's `base`
+and **fails** — not warns — when either:
+
+- it is behind the base by more than `stale_threshold` (default 50), or
+- it carries commits the base does not, meaning the branch has diverged.
+
+A checkout left on an old branch makes a lane read stale source, grep stale CI
+config and reason about a codebase that no longer exists — and the lane reports
+success while doing it, because nothing in its own view looks wrong. That
+failure is silent and it is expensive, which is why a warning is not enough.
+
+The message carries the numbers rather than the words "stale checkout":
+
+```
+here  local  checkout app  FAIL  39ms  on develop, 60 behind and 1 ahead of origin/main, not an ancestor of it
+```
+
+Use `--force` to dispatch anyway, or raise `stale_threshold` for a repo where
+being behind is expected.
 
 `sprintd run` runs preflight first and refuses to dispatch if it fails. Use
 `--force` to dispatch anyway, or `--skip-preflight` to skip it.
@@ -132,7 +154,9 @@ accounts:
 repos:
   app:
     path: ~/Code/example-org/app
-    max_concurrent: 4                 # lanes at once in this checkout
+    max_concurrent: 4                 # lanes at once in this repo
+    base: origin/main                 # what lanes branch from (default)
+    stale_threshold: 50               # commits behind base before preflight fails
 
 lanes:
   - id: L1                            # unique
@@ -159,20 +183,51 @@ only thing that makes the lane real.
 The sprint is rejected, naming the lane, if any lane has no predicate, no
 prompt, no goal, an unknown repo or machine, an unknown or self-referential
 `needs`, a duplicate id, or no resolvable model or deadline. `needs` cycles are
-rejected too, as is a repo with a `max_concurrent` below 1, an account with a
-`reserve_floor_pct` outside 0–100, and two accounts sharing a `config_dir` —
-their credentials could not be told apart at dispatch.
+rejected too, as is a repo with a `max_concurrent` below 1 or a negative
+`stale_threshold`, an account with a `reserve_floor_pct` outside 0–100, and two
+accounts sharing a `config_dir` — their credentials could not be told apart at
+dispatch.
+
+Lane ids and the sprint name must be usable in a branch name (letters, digits,
+dot, dash, underscore), because both become part of one.
 
 ## How lanes run
 
-**Dispatch.** `claude -p '<prompt>' --model <model>` in the repo, locally or
-over ssh. The deadline is enforced in-process, not by wrapping the command in
-`timeout(1)` — macOS does not ship `timeout`, and one of the target machines is
-a Mac. Cancelling kills the child's whole process group, so an agent that
-forked a build or a test runner does not outlive its own lane.
+**Every lane gets its own git worktree**, branched from the repo's `base` after
+a fresh fetch, at `<repo>/../.sprintd-worktrees/<sprint>/<lane>` on the branch
+`sprintd/<sprint>/<lane>`.
+
+This is not a convenience. It is what makes a `max_concurrent` above 1 coherent
+at all: without it, concurrent lanes would share one working tree, one index
+and one checked-out branch, and would silently overwrite each other's edits. It
+also decouples a lane from whatever the primary checkout happens to be sitting
+on, so a neglected tree cannot feed it stale source.
+
+Three consequences worth knowing:
+
+- **Write predicates relative to the repo root.** A predicate is run inside the
+  lane's worktree, so `./scripts/check.sh` checks the lane's work. An absolute
+  path such as `cd ~/Code/org/app && ./scripts/check.sh` escapes the worktree
+  and verifies the wrong tree — it would pass or fail on code the lane never
+  touched.
+- **`needs` is ordering, not code inheritance.** A dependent lane branches from
+  the base like any other, so it sees its dependency's work only once that work
+  has landed on the base. The base is re-fetched when each lane's worktree is
+  created, so a dependency merged mid-sprint is picked up.
+- **Worktrees are never removed automatically.** An agent may have left
+  uncommitted work in one, and an escalated lane's tree is exactly the one
+  someone will want to read. Their paths and branches are recorded in
+  `results.jsonl`. Clean them up with `git worktree remove` (or delete the
+  directory and run `git worktree prune`) once the work is merged or discarded.
+
+**Dispatch.** `claude -p '<prompt>' --model <model>` in the lane's worktree,
+locally or over ssh. The deadline is enforced in-process, not by wrapping the
+command in `timeout(1)` — macOS does not ship `timeout`, and one of the target
+machines is a Mac. Cancelling kills the child's whole process group, so an
+agent that forked a build or a test runner does not outlive its own lane.
 
 **Concurrency** is capped per repo by `max_concurrent`, and by nothing else.
-The scarce resource is mergeable changes in one checkout, not CPU or memory, so
+The scarce resource is mergeable changes in one repo, not CPU or memory, so
 there is deliberately no load-based throttling.
 
 **Ordering.** A lane waits for every id in its `needs`. If one of them
@@ -225,7 +280,7 @@ The run directory holds everything:
 
 `results.jsonl` records `dispatched`, `stalled`, `killed`, `requeued`,
 `predicate_failed`, `complete` and `escalated`, each with a timestamp, machine,
-account, model and attempt number. Terminal records carry the predicate output,
+account, model, attempt number, and the lane's worktree and branch. Terminal records carry the predicate output,
 so a failure can be read without re-running anything. Each record is flushed as
 it is written, so a killed sprintd still leaves a complete history.
 
