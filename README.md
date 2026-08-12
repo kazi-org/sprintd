@@ -571,6 +571,13 @@ Two honest limits, both carried in the payload's `notes`:
 - A run directory read on a different machine from the one that produced it
   reports `unknown`, because the process cannot be checked from there.
 
+A run killed exactly mid-write to `results.jsonl` leaves one truncated line at
+the end of the file — everything recorded before it was already flushed. That
+line is dropped rather than failing the whole report; a note says so, and the
+lane it belonged to falls back to whatever the manifest declared for it
+(`pending`, if it had never resolved before). A malformed line anywhere else in
+the file is real corruption, not a partial write, and still fails.
+
 #### What the payload contains
 
 - `sprint` — name, `opened`/`closes` from the sprint file, run directory, start
