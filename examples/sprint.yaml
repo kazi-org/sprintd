@@ -1,0 +1,89 @@
+# An example sprint file. Copy it, edit it, and keep it out of version control
+# if its prompts contain anything private.
+#
+# Every lane needs a predicate. sprintd refuses to start a sprint where one
+# does not, by lane id, before anything is dispatched.
+
+sprint: example-launch-2026-08-12
+opened: 2026-08-12T08:00:00Z
+closes: 2026-08-12T20:00:00Z
+
+defaults:
+  model: sonnet
+  deadline: 90m
+  retries: 2
+
+machines:
+  # "local" runs without ssh. Everything else is an ssh destination and must
+  # already work non-interactively: sprintd uses BatchMode, so a machine that
+  # would prompt for a password is reported as unreachable by preflight.
+  mini: { host: local }
+  builder: { host: user@10.0.0.2 }
+  laptop: { host: user@10.0.0.3 }
+
+accounts:
+  # config_dir is the CLAUDE_CONFIG_DIR holding that account's credentials.
+  # It is how Claude Code keeps concurrently usable accounts apart, and how
+  # sprintd pins a lane to one of them. Leave it unset for the ambient
+  # account; at most one account may do that.
+  #
+  # weekly_token_limit is your plan's weekly entitlement. It is the
+  # denominator for utilisation: ccusage reports what was consumed but knows
+  # nothing about what you are entitled to. Without it, sprintd cannot
+  # enforce this account's reserve floor or the 85% hard stop, says so in the
+  # log, and uses the account only as a last resort.
+  - name: primary
+    reserve_floor_pct: 30 # keep 30% of the week in hand for interactive work
+    weekly_token_limit: 500000000
+  - name: secondary
+    reserve_floor_pct: 0
+    config_dir: ~/.claude-secondary
+    weekly_token_limit: 500000000
+  - name: tertiary
+    reserve_floor_pct: 0
+    config_dir: ~/.claude-tertiary
+    weekly_token_limit: 500000000
+
+repos:
+  # max_concurrent caps lanes per repo, because the scarce resource is
+  # mergeable changes in one checkout, not CPU.
+  app:
+    path: ~/Code/example-org/app
+    max_concurrent: 4
+  service:
+    path: ~/Code/example-org/service
+    max_concurrent: 2
+
+lanes:
+  - id: L1
+    repo: app
+    goal: "The double biometric prompt on cold launch is gone"
+    prompt: >
+      On a cold launch the app shows the biometric prompt twice. Find the
+      cause and fix it. The check at scripts/cold-launch-check.sh must exit
+      zero when you are done; run it yourself before you finish.
+    predicate: "./scripts/cold-launch-check.sh"
+    machine: mini
+    model: opus
+    deadline: 90m
+
+  - id: L2
+    repo: service
+    goal: "The session endpoint returns 401 rather than 500 for a bad token"
+    prompt: >
+      GET /v1/session returns 500 when the bearer token is malformed. It
+      should return 401. Fix it and add a regression test.
+    predicate: "go test ./internal/api/ -run TestSessionRejectsMalformedToken"
+    machine: builder
+    deadline: 45m
+
+  - id: L3
+    repo: app
+    goal: "The release build ships with the fixed launch path"
+    prompt: >
+      Cut a release build and confirm it boots clean.
+      Do not start until L1 has landed.
+    predicate: "./scripts/release-smoke.sh"
+    machine: mini
+    needs: [L1]
+    retries: 1

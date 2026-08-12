@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Run sprintd under launchd so a sprint survives a closed terminal.
+
+  Install:
+    cp examples/com.kazi.sprintd.plist ~/Library/LaunchAgents/
+    # edit the paths below to match your machine, then:
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.kazi.sprintd.plist
+    launchctl kickstart -p gui/$(id -u)/com.kazi.sprintd
+
+  Stop and remove:
+    launchctl bootout gui/$(id -u)/com.kazi.sprintd
+
+  Notes:
+    - RunAtLoad is false and KeepAlive is absent on purpose. A sprint is a
+      bounded job with a close time, not a daemon; restarting it
+      automatically would re-dispatch lanes that already escalated. Start it
+      with kickstart when you want a sprint to run.
+    - sprintd exits 2 when any lane escalated. launchd records that in
+      StandardErrorPath; it is the signal to look at the run directory.
+    - The agent runs in a GUI session (gui/$UID), not as a system daemon, so
+      it can reach the login keychain that holds the Claude credentials. A
+      LaunchDaemon cannot, and every lane would fail to authenticate.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.kazi.sprintd</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/sprintd</string>
+        <string>run</string>
+        <string>--sprint</string>
+        <string>/Users/CHANGEME/sprints/current.yaml</string>
+        <string>--run-dir</string>
+        <string>/Users/CHANGEME/sprints/runs/current</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/CHANGEME/sprints</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- ssh and claude are usually installed outside launchd's default
+             PATH; without this every remote lane fails with "command not
+             found". -->
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/CHANGEME/sprints/logs/sprintd.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/CHANGEME/sprints/logs/sprintd.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
