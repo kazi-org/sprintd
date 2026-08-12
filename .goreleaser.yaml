@@ -69,7 +69,7 @@ brews:
     # API calls, not asset fetches), so the download 404s. The strategy lives
     # in the tap at lib/custom_download_strategy.rb.
     download_strategy: GitHubPrivateRepositoryReleaseDownloadStrategy
-    custom_require: lib/custom_download_strategy
+    custom_require: ../lib/custom_download_strategy
     homepage: https://github.com/kazi-org/sprintd
     description: Token-free scheduler that dispatches deadline-bounded agent lanes and verifies them with acceptance predicates
     license: MIT
