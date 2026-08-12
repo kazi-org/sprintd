@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -19,6 +20,25 @@ var ErrInvalid = errors.New("invalid sprint file")
 
 // LocalHost is the machine host value meaning "run on this machine".
 const LocalHost = "local"
+
+// DefaultBase is the ref lanes branch from when a repo does not name one.
+const DefaultBase = "origin/main"
+
+// DefaultStaleThreshold is how many commits a checkout may sit behind its base
+// before preflight fails.
+//
+// It is a hard failure rather than a warning on purpose. A checkout far behind
+// its base makes a lane read stale source and branch from the wrong commit,
+// and the lane reports success while doing it because nothing in its own view
+// looks wrong. A warning for that gets scrolled past; the cost arrives later,
+// as a confident but wrong result.
+const DefaultStaleThreshold = 50
+
+// refSafe matches names that are safe to embed in a git branch name. Lane ids
+// and the sprint name both become part of one, so a name with a space or a
+// leading dash would produce a branch git refuses to create -- or, worse, an
+// argument git reads as a flag.
+var refSafe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 // Duration wraps time.Duration so YAML scalars such as "90m" decode directly.
 type Duration time.Duration
@@ -80,6 +100,30 @@ type Account struct {
 type Repo struct {
 	Path          string `yaml:"path"`
 	MaxConcurrent int    `yaml:"max_concurrent"`
+	// Base is the ref every lane in this repo branches from, freshly fetched.
+	// Defaults to DefaultBase.
+	Base string `yaml:"base"`
+	// StaleThreshold is how many commits the checkout may sit behind Base
+	// before preflight fails. A pointer so that 0, meaning "must be exactly
+	// current", is distinguishable from unset. Defaults to
+	// DefaultStaleThreshold.
+	StaleThreshold *int `yaml:"stale_threshold"`
+}
+
+// BaseRef returns the repo's base ref with the default applied.
+func (r Repo) BaseRef() string {
+	if r.Base == "" {
+		return DefaultBase
+	}
+	return r.Base
+}
+
+// StaleLimit returns the repo's stale threshold with the default applied.
+func (r Repo) StaleLimit() int {
+	if r.StaleThreshold == nil {
+		return DefaultStaleThreshold
+	}
+	return *r.StaleThreshold
 }
 
 // Lane is one deadline-bounded unit of agent work plus the predicate that
@@ -115,6 +159,8 @@ type ResolvedLane struct {
 	RepoPath      string
 	MaxConcurrent int
 	Host          string
+	// Base is the ref this lane's worktree is branched from.
+	Base string
 	// Attempts is the total number of dispatches allowed: retries + 1.
 	Attempts int
 	Timeout  time.Duration
@@ -192,6 +238,10 @@ func (s *Sprint) Validate() error {
 	if strings.TrimSpace(s.Name) == "" {
 		return fmt.Errorf("%w: sprint name is empty", ErrInvalid)
 	}
+	if !refSafe.MatchString(s.Name) {
+		return fmt.Errorf("%w: sprint name %q is not usable in a branch name; "+
+			"use letters, digits, dot, dash or underscore", ErrInvalid, s.Name)
+	}
 	if !s.Opened.IsZero() && !s.Closes.IsZero() && !s.Closes.After(s.Opened) {
 		return fmt.Errorf("%w: closes (%s) is not after opened (%s)",
 			ErrInvalid, s.Closes.Format(time.RFC3339), s.Opened.Format(time.RFC3339))
@@ -232,6 +282,14 @@ func (s *Sprint) validateRepos() error {
 		if repo.MaxConcurrent < 1 {
 			return fmt.Errorf("%w: repo %s has max_concurrent %d, want at least 1",
 				ErrInvalid, name, repo.MaxConcurrent)
+		}
+		if strings.TrimSpace(repo.Base) != repo.Base {
+			return fmt.Errorf("%w: repo %s has a base with surrounding whitespace: %q",
+				ErrInvalid, name, repo.Base)
+		}
+		if repo.StaleThreshold != nil && *repo.StaleThreshold < 0 {
+			return fmt.Errorf("%w: repo %s has stale_threshold %d, want zero or more",
+				ErrInvalid, name, *repo.StaleThreshold)
 		}
 	}
 	return nil
@@ -278,6 +336,10 @@ func (s *Sprint) validateLanes() error {
 		}
 		if ids[ln.ID] {
 			return fmt.Errorf("%w: duplicate lane id %s", ErrInvalid, ln.ID)
+		}
+		if !refSafe.MatchString(ln.ID) {
+			return fmt.Errorf("%w: lane id %q is not usable in a branch name; "+
+				"use letters, digits, dot, dash or underscore", ErrInvalid, ln.ID)
 		}
 		ids[ln.ID] = true
 	}
@@ -388,6 +450,7 @@ func (s *Sprint) ResolvedLanes() []ResolvedLane {
 			RepoPath:      repo.Path,
 			MaxConcurrent: repo.MaxConcurrent,
 			Host:          s.Machines[ln.Machine].Host,
+			Base:          repo.BaseRef(),
 			Attempts:      s.retriesFor(ln) + 1,
 			Timeout:       s.deadlineFor(ln),
 		}
@@ -397,24 +460,38 @@ func (s *Sprint) ResolvedLanes() []ResolvedLane {
 	return out
 }
 
-// MachineRepos maps each machine name to the repo paths lanes use on it.
-func (s *Sprint) MachineRepos() map[string][]string {
-	out := map[string][]string{}
+// RepoTarget is a repo as preflight needs to see it on one machine.
+type RepoTarget struct {
+	Name           string
+	Path           string
+	Base           string
+	StaleThreshold int
+}
+
+// MachineRepos maps each machine name to the repos lanes use on it.
+func (s *Sprint) MachineRepos() map[string][]RepoTarget {
+	out := map[string][]RepoTarget{}
 	for _, ln := range s.Lanes {
-		path := s.Repos[ln.Repo].Path
-		if !contains(out[ln.Machine], path) {
-			out[ln.Machine] = append(out[ln.Machine], path)
+		if hasRepo(out[ln.Machine], ln.Repo) {
+			continue
 		}
+		repo := s.Repos[ln.Repo]
+		out[ln.Machine] = append(out[ln.Machine], RepoTarget{
+			Name:           ln.Repo,
+			Path:           repo.Path,
+			Base:           repo.BaseRef(),
+			StaleThreshold: repo.StaleLimit(),
+		})
 	}
 	for name := range out {
-		sort.Strings(out[name])
+		sort.Slice(out[name], func(i, j int) bool { return out[name][i].Name < out[name][j].Name })
 	}
 	return out
 }
 
-func contains(haystack []string, needle string) bool {
-	for _, s := range haystack {
-		if s == needle {
+func hasRepo(targets []RepoTarget, name string) bool {
+	for _, t := range targets {
+		if t.Name == name {
 			return true
 		}
 	}

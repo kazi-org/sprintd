@@ -18,6 +18,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/kazi-org/sprintd/internal/gitrepo"
 	"github.com/kazi-org/sprintd/internal/machine"
 	"github.com/kazi-org/sprintd/internal/sprint"
 )
@@ -103,7 +104,48 @@ func Run(ctx context.Context, s *sprint.Sprint, exec Executor, opts Options) []R
 	return reports
 }
 
-func checkMachine(ctx context.Context, s *sprint.Sprint, exec Executor, name string, repoPaths []string) Report {
+// checkRepoFreshness fetches the repo and grades where the checkout sits
+// relative to the base lanes branch from.
+//
+// A repo path in a sprint file is not necessarily a usable checkout. One left
+// on an old branch, far behind its base, feeds lanes stale source and stale CI
+// config, and they report success while reading it. That is why being behind
+// is a failure here and not a warning, and why the message carries the actual
+// counts instead of the words "stale checkout".
+func checkRepoFreshness(ctx context.Context, exec Executor, host string, repo sprint.RepoTarget) []Check {
+	start := time.Now()
+	if err := gitrepo.Fetch(ctx, exec, host, repo.Path); err != nil {
+		return []Check{{
+			Name:     "git fetch " + repo.Name,
+			Detail:   err.Error(),
+			Duration: time.Since(start),
+		}}
+	}
+	checks := []Check{{
+		Name: "git fetch " + repo.Name, OK: true, Duration: time.Since(start),
+	}}
+
+	start = time.Now()
+	status, err := gitrepo.Inspect(ctx, exec, host, repo.Path, repo.Base)
+	check := Check{Name: "checkout " + repo.Name, Duration: time.Since(start)}
+	switch {
+	case err != nil:
+		check.Detail = err.Error()
+	case !status.BaseResolved:
+		check.Detail = fmt.Sprintf("%s; fetch it or correct the repo's base", status.Describe(repo.Base))
+	case status.Stale(repo.StaleThreshold):
+		check.Detail = fmt.Sprintf("%s; more than %d behind, so lanes would read stale source",
+			status.Describe(repo.Base), repo.StaleThreshold)
+	case status.Diverged():
+		check.Detail = fmt.Sprintf("%s; it carries commits the base does not", status.Describe(repo.Base))
+	default:
+		check.OK = true
+		check.Detail = status.Describe(repo.Base)
+	}
+	return append(checks, check)
+}
+
+func checkMachine(ctx context.Context, s *sprint.Sprint, exec Executor, name string, repos []sprint.RepoTarget) Report {
 	host := s.Machines[name].Host
 	report := Report{Machine: name, Host: host}
 
@@ -121,17 +163,16 @@ func checkMachine(ctx context.Context, s *sprint.Sprint, exec Executor, name str
 		return report
 	}
 
-	for _, path := range repoPaths {
-		report.Checks = append(report.Checks, runCheck(ctx, exec,
-			"repo "+path, machine.Command{
-				Host:   host,
-				Script: fmt.Sprintf("test -d %s/.git && echo %s", machine.Quote(path), probeMarker),
-			}, probeMarker))
-		report.Checks = append(report.Checks, runCheck(ctx, exec,
-			"git fetch "+path, machine.Command{
-				Host: host, Dir: path,
-				Script: "git fetch --dry-run --quiet && echo " + probeMarker,
-			}, probeMarker))
+	for _, repo := range repos {
+		present := runCheck(ctx, exec, "repo "+repo.Name, machine.Command{
+			Host:   host,
+			Script: fmt.Sprintf("test -d %s/.git && echo %s", machine.Quote(repo.Path), probeMarker),
+		}, probeMarker)
+		report.Checks = append(report.Checks, present)
+		if !present.OK {
+			continue
+		}
+		report.Checks = append(report.Checks, checkRepoFreshness(ctx, exec, host, repo)...)
 	}
 
 	report.Checks = append(report.Checks, runCheck(ctx, exec, "claude --version",
