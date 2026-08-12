@@ -13,6 +13,8 @@
 
 - **`needs` semantics recorded and guarded** — David Ndungu, 2026-08-12, [#5](https://github.com/kazi-org/sprintd/pull/5). Docs, example and one test; no release. Ordering-only semantics documented in the README with the deep-chain anti-pattern called out, moved out of Planned into Decided, the example rewritten to show genuine ordering instead of inheritance, and a test that goes red against the rejected branch-from-dependency design.
 
+- **sprintd v0.4.0 — a retried command is told why the last attempt failed** — David Ndungu, 2026-08-12, [#6](https://github.com/kazi-org/sprintd/pull/6). `SPRINTD_ATTEMPT` on every dispatch and `SPRINTD_LAST_FAILURE` on attempts after the first, carrying the failure reason and the predicate's output, bounded, reason line kept whole. Closes the parity gap where a `command:` lane re-ran identically and burned a deadline (and dispatched-agent quota) per retry to reproduce a known failure. Covers the ssh path, where the multi-line value travels through a remote shell.
+
 ## In progress
 
 _Nothing._
