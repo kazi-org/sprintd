@@ -1,0 +1,77 @@
+version: 2
+
+project_name: sprintd
+
+before:
+  hooks:
+    - go mod tidy
+    - go test ./...
+
+builds:
+  - id: sprintd
+    main: .
+    binary: sprintd
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      # sprintd targets the three machines it dispatches to: two Macs and one
+      # linux/amd64 box. linux/arm64 is not one of them.
+      - goos: linux
+        goarch: arm64
+
+archives:
+  - id: sprintd
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - README.md
+      - LICENSE
+      - examples/**/*
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+brews:
+  - name: sprintd
+    repository:
+      owner: kazi-org
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
+    homepage: https://github.com/kazi-org/sprintd
+    description: Token-free scheduler that dispatches deadline-bounded agent lanes and verifies them with acceptance predicates
+    license: MIT
+    commit_author:
+      name: David Ndungu
+      email: david@feza.ai
+    install: |
+      bin.install "sprintd"
+    test: |
+      assert_match "sprintd", shell_output("#{bin}/sprintd version")
+
+release:
+  draft: false
+  prerelease: auto
