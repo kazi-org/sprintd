@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/kazi-org/sprintd/internal/sprint"
 )
@@ -39,13 +40,49 @@ type Reader interface {
 // It is safe for concurrent use: lanes are dispatched from separate goroutines
 // and each asks for an account as it starts.
 type Allocator struct {
-	mu       sync.Mutex
-	accounts []sprint.Account
-	usage    map[string]Usage
-	metered  map[string]bool
-	assigned map[string]int
-	next     int
-	log      *slog.Logger
+	mu        sync.Mutex
+	accounts  []sprint.Account
+	usage     map[string]Usage
+	metered   map[string]bool
+	assigned  map[string]int
+	next      int
+	log       *slog.Logger
+	sampledAt time.Time
+}
+
+// Sample is one account's usage as it was read, for reporting.
+type Sample struct {
+	Name            string
+	ReserveFloorPct float64
+	WeeklyTokens    int64
+	WeeklyLimit     int64
+	WeeklyPct       float64
+	Metered         bool
+}
+
+// SampledAt is when usage was read. It is read once per run, so anything
+// reporting these figures has to say how old they are.
+func (a *Allocator) SampledAt() time.Time { return a.sampledAt }
+
+// Snapshot returns each account's usage as sampled at run start.
+func (a *Allocator) Snapshot() []Sample {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make([]Sample, 0, len(a.accounts))
+	for _, acct := range a.accounts {
+		sample := Sample{
+			Name:            acct.Name,
+			ReserveFloorPct: acct.ReserveFloorPct,
+			WeeklyLimit:     acct.WeeklyTokenLimit,
+			WeeklyTokens:    a.usage[acct.Name].WeeklyTokens,
+		}
+		if pct, known := a.weeklyPct(acct.Name); known {
+			sample.WeeklyPct = pct
+			sample.Metered = true
+		}
+		out = append(out, sample)
+	}
+	return out
 }
 
 // New builds an Allocator and reads each account's current usage once.
@@ -60,11 +97,12 @@ func New(ctx context.Context, accounts []sprint.Account, reader Reader, log *slo
 		log = slog.Default()
 	}
 	a := &Allocator{
-		accounts: accounts,
-		usage:    make(map[string]Usage, len(accounts)),
-		metered:  make(map[string]bool, len(accounts)),
-		assigned: make(map[string]int, len(accounts)),
-		log:      log,
+		accounts:  accounts,
+		sampledAt: time.Now().UTC(),
+		usage:     make(map[string]Usage, len(accounts)),
+		metered:   make(map[string]bool, len(accounts)),
+		assigned:  make(map[string]int, len(accounts)),
+		log:       log,
 	}
 	for _, acct := range accounts {
 		if acct.WeeklyTokenLimit <= 0 {

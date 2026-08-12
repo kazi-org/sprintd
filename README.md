@@ -51,7 +51,7 @@ go build -o sprintd .
 ```
 sprintd preflight --sprint <file>   check every machine can run lanes
 sprintd run       --sprint <file>   dispatch the sprint
-sprintd status    --run <dir>       show the state of a run
+sprintd status  [--run <dir>] [--json]   show the state of a run
 sprintd version                     print the version
 ```
 
@@ -514,6 +514,8 @@ it is written, so a killed sprintd still leaves a complete history.
 sprintd status --run .sprintd/example-launch-2026-08-12-20260812T090000Z
 ```
 
+With no `--run`, it reads the most recent run under `.sprintd`.
+
 ```
 sprint: example-launch-2026-08-12  lanes: 3
 
@@ -524,6 +526,81 @@ L3    escalated  3        mini     secondary  sonnet  31m8s  3 attempts exhauste
 
 complete: 2  escalated: 1  in flight: 0
 ```
+
+### `sprintd status --json` — the machine-readable interface
+
+```sh
+sprintd status --json                 # the most recent run under .sprintd
+sprintd status --json --run <dir>     # a specific run
+```
+
+This exists so nothing has to parse `results.jsonl`. That file is an
+append-only event log whose record shapes belong to sprintd and will change;
+anything reading it would break silently. **This command is the supported
+interface** — a stable, versioned shape that a dashboard or monitor can depend
+on.
+
+`schema_version` is the contract. It is `1` today. It will be raised only when
+a field is removed or repurposed; adding a field is not a break. A consumer
+should refuse a version it does not recognise rather than guess.
+
+**Exit status:** `0` normally, `2` if any lane escalated, `1` on a real error.
+The JSON is written to stdout in every case except a real error, so a consumer
+can read the payload and treat `2` as data rather than failure.
+
+#### `status` is the answer to "is anything running"
+
+```
+no_run       no run was found at all — a healthy answer, not an error
+running      a sprintd process is alive and still working
+finished     the run reached its own end and recorded it
+interrupted  the run never recorded an end and its process is gone
+unknown      liveness could not be determined
+```
+
+This is a recorded fact, never inferred from timestamps. A run writes
+`run.json` when it starts and rewrites it with a completion time when it ends;
+`running` means that file has no completion **and** the recorded process id
+still exists. So a sprint killed mid-flight reads `interrupted`, not `running`,
+and never renders as live when it is not.
+
+Two honest limits, both carried in the payload's `notes`:
+
+- Liveness is a check on a recorded process id. A reused pid could in principle
+  read as running. There is no cheaper check that is more truthful.
+- A run directory read on a different machine from the one that produced it
+  reports `unknown`, because the process cannot be checked from there.
+
+#### What the payload contains
+
+- `sprint` — name, `opened`/`closes` from the sprint file, run directory, start
+  and completion times, elapsed seconds.
+- `lanes` — every lane the sprint declared, including ones that never started.
+  Per lane: repo, machine, account, model or command, state, whether that state
+  is terminal, attempt number, dispatched and resolved timestamps, duration,
+  reason, the captured predicate output for terminal failures, and the worktree
+  and branch holding the work.
+- `totals` — lanes, dispatched, converged, escalated, unresolved, and counts by
+  state. A consumer should not have to derive these.
+- `machines` — every declared machine, and for each whether it is `busy`, which
+  lanes are running on it, and which lanes are unresolved. **A machine with
+  nothing on it appears, idle, rather than being absent.** There is
+  deliberately no utilisation percentage: sprintd knows what it dispatched
+  where, it does not measure load, and a number it cannot observe would be
+  worse on a dashboard than no number.
+- `accounts` — each account's weekly usage **as sampled once when the run
+  started**, with `sampled_at` and `sampled_once: true`. sprintd does not
+  refresh this during a run, so a consumer must not present it as live.
+- `notes` — caveats that apply to this payload, meant to be rendered.
+
+`lanes`, `machines` and `accounts` are always arrays, never `null`, so a
+consumer can iterate without a nil check.
+
+#### Reporting never mutates
+
+`status` only reads. It does not touch a worktree, write to the run directory,
+or alter a run in any way, so it is safe to poll and safe to run against a
+sprint that is live.
 
 ## Running supervised
 

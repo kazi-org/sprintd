@@ -21,6 +21,7 @@ import (
 	"github.com/kazi-org/sprintd/internal/machine"
 	"github.com/kazi-org/sprintd/internal/results"
 	"github.com/kazi-org/sprintd/internal/sprint"
+	"github.com/kazi-org/sprintd/internal/status"
 )
 
 // Defaults for the watchdog and the predicate check.
@@ -60,6 +61,10 @@ type Config struct {
 	Log              *slog.Logger
 	// Now is the clock, injectable for tests.
 	Now func() time.Time
+	// StartedAt is when the run began, from the caller's point of view. It is
+	// passed in because the run directory -- and its manifest -- exist before
+	// the Runner does, and both writes must report the same start.
+	StartedAt time.Time
 }
 
 // Runner executes one sprint.
@@ -72,6 +77,9 @@ type Runner struct {
 	// worktrees caches each lane's prepared tree so a retry continues in the
 	// tree the previous attempt left rather than starting over.
 	worktrees sync.Map
+	// startedAt is fixed when the Runner is built so the manifest reports one
+	// start time across both writes.
+	startedAt time.Time
 }
 
 func (r *Runner) repoLock(repo string) *sync.Mutex {
@@ -122,7 +130,76 @@ func New(cfg Config) (*Runner, error) {
 			return nil, fmt.Errorf("creating run directory %s: %w", sub, err)
 		}
 	}
-	return &Runner{cfg: cfg}, nil
+	startedAt := cfg.StartedAt
+	if startedAt.IsZero() {
+		startedAt = cfg.Now().UTC()
+	}
+	return &Runner{cfg: cfg, startedAt: startedAt.UTC()}, nil
+}
+
+// writeManifest records what the event log cannot carry: the sprint window,
+// the machines and accounts in play, and whether this run has ended.
+//
+// It is rewritten with completedAt set when the run finishes; a manifest with
+// no completion plus a dead process is how an interrupted run is told from a
+// live one.
+func (r *Runner) writeManifest(completedAt *time.Time) error {
+	s := r.cfg.Sprint
+	m := status.Manifest{
+		Sprint:    s.Name,
+		StartedAt: r.startedAt,
+		PID:       os.Getpid(),
+	}
+	if host, err := os.Hostname(); err == nil {
+		m.Hostname = host
+	}
+	if !s.Opened.IsZero() {
+		opened := s.Opened
+		m.Opened = &opened
+	}
+	if !s.Closes.IsZero() {
+		closes := s.Closes
+		m.Closes = &closes
+	}
+	m.CompletedAt = completedAt
+
+	for _, name := range sortedNames(s.Machines) {
+		m.Machines = append(m.Machines, status.Machine{Name: name, Host: s.Machines[name].Host})
+	}
+	for _, ln := range s.ResolvedLanes() {
+		m.Lanes = append(m.Lanes, status.LaneSpec{
+			ID: ln.ID, Repo: ln.Repo, Machine: ln.Machine,
+			Goal: ln.Goal, Model: ln.Model, Command: ln.Command,
+		})
+	}
+	sampledAt := r.cfg.Allocator.SampledAt()
+	for _, sample := range r.cfg.Allocator.Snapshot() {
+		acct := status.AccountSample{
+			Name:            sample.Name,
+			ReserveFloorPct: sample.ReserveFloorPct,
+			WeeklyTokens:    sample.WeeklyTokens,
+			WeeklyLimit:     sample.WeeklyLimit,
+			Metered:         sample.Metered,
+			SampledOnce:     true,
+		}
+		if sample.Metered {
+			pct := sample.WeeklyPct
+			acct.WeeklyPct = &pct
+			at := sampledAt
+			acct.SampledAt = &at
+		}
+		m.Accounts = append(m.Accounts, acct)
+	}
+	return status.WriteManifest(r.cfg.RunDir, m)
+}
+
+func sortedNames[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // laneState is a lane's position in the schedule.
@@ -147,6 +224,19 @@ type laneOutcome struct {
 // finish, and repeats. Concurrency is bounded per repo because the scarce
 // resource is mergeable changes in one checkout, not CPU.
 func (r *Runner) Run(ctx context.Context) (Summary, error) {
+	// The manifest is what lets anything outside this process answer "is a
+	// sprint running", and it has to exist before the first lane does, so a
+	// run killed seconds in is still reportable.
+	if err := r.writeManifest(nil); err != nil {
+		r.cfg.Log.Error("writing run manifest", "error", err)
+	}
+	defer func() {
+		done := r.cfg.Now().UTC()
+		if err := r.writeManifest(&done); err != nil {
+			r.cfg.Log.Error("finalising run manifest", "error", err)
+		}
+	}()
+
 	lanes := r.cfg.Sprint.ResolvedLanes()
 	byID := make(map[string]sprint.ResolvedLane, len(lanes))
 	state := make(map[string]laneState, len(lanes))
