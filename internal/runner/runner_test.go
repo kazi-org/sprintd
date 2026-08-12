@@ -1119,3 +1119,154 @@ func TestDependentLaneBranchesFromBaseNotItsDependency(t *testing.T) {
 		t.Fatalf("worktree setups = %d, want one per lane", setups)
 	}
 }
+
+// TestFailureContextEnvOnRetry pins the parity fix for command lanes: a retry
+// carries why the last attempt failed, and a first attempt does not, so a
+// command can tell the two apart.
+func TestFailureContextEnvOnRetry(t *testing.T) {
+	t.Parallel()
+
+	exec := newFakeExec(func(_ context.Context, c call, attempt int, out io.Writer) (machine.Result, error) {
+		if c.Predicate {
+			if attempt == 1 {
+				fmt.Fprintln(out, "FAIL: saw 2 biometric prompts, expected 1")
+				return machine.Result{ExitCode: 1}, nil
+			}
+			fmt.Fprintln(out, "OK")
+			return machine.Result{ExitCode: 0}, nil
+		}
+		fmt.Fprintln(out, "working")
+		return machine.Result{ExitCode: 0}, nil
+	})
+
+	h := newHarness(t, fixture(t, commandLane("L1", "kazi apply goals/lane=L1.toml")), exec, nil)
+	if _, err := h.runner.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+
+	var dispatches []call
+	for _, c := range exec.snapshot() {
+		if !c.Setup && !c.Predicate {
+			dispatches = append(dispatches, c)
+		}
+	}
+	if len(dispatches) != 2 {
+		t.Fatalf("dispatches = %d, want 2", len(dispatches))
+	}
+
+	if got, ok := dispatches[0].Env[EnvLastFailure]; ok {
+		t.Errorf("%s was set on the first attempt (%q); its absence is how a command knows the run is fresh",
+			EnvLastFailure, got)
+	}
+	if got, want := dispatches[0].Env[EnvAttempt], "1"; got != want {
+		t.Errorf("first attempt %s = %q, want %q", EnvAttempt, got, want)
+	}
+
+	last, ok := dispatches[1].Env[EnvLastFailure]
+	if !ok {
+		t.Fatalf("%s was not set on the retry", EnvLastFailure)
+	}
+	for _, want := range []string{"predicate failed", "FAIL: saw 2 biometric prompts, expected 1"} {
+		if !strings.Contains(last, want) {
+			t.Errorf("%s = %q, want it to contain %q", EnvLastFailure, last, want)
+		}
+	}
+	if got, want := dispatches[1].Env[EnvAttempt], "2"; got != want {
+		t.Errorf("retry %s = %q, want %q", EnvAttempt, got, want)
+	}
+}
+
+// TestFailureContextEnvIsBounded keeps an unbounded predicate from becoming an
+// unbounded environment variable, which is its own failure mode -- especially
+// over ssh, where it travels on the command line.
+func TestFailureContextEnvIsBounded(t *testing.T) {
+	t.Parallel()
+
+	huge := strings.Repeat("noise ", 20000) + "THE-REAL-ERROR-AT-THE-END"
+	exec := newFakeExec(func(_ context.Context, c call, attempt int, out io.Writer) (machine.Result, error) {
+		if c.Predicate {
+			if attempt == 1 {
+				fmt.Fprintln(out, huge)
+				return machine.Result{ExitCode: 1}, nil
+			}
+			return machine.Result{ExitCode: 0}, nil
+		}
+		fmt.Fprintln(out, "working")
+		return machine.Result{ExitCode: 0}, nil
+	})
+
+	h := newHarness(t, fixture(t, commandLane("L1", "kazi apply goals/lane=L1.toml")), exec, nil)
+	if _, err := h.runner.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+
+	var retryEnv string
+	for _, c := range exec.snapshot() {
+		if !c.Setup && !c.Predicate {
+			if v, ok := c.Env[EnvLastFailure]; ok {
+				retryEnv = v
+			}
+		}
+	}
+	if retryEnv == "" {
+		t.Fatal("no retry carried the failure context")
+	}
+	if len(retryEnv) > maxContextBytes {
+		t.Errorf("%s is %d bytes, want at most %d", EnvLastFailure, len(retryEnv), maxContextBytes)
+	}
+	// The tail is what matters: the error is at the end of the output.
+	if !strings.Contains(retryEnv, "THE-REAL-ERROR-AT-THE-END") {
+		t.Error("truncation dropped the end of the output, which is where the error is")
+	}
+	if !strings.HasPrefix(retryEnv, "predicate failed") {
+		t.Errorf("truncation ate the reason line; got prefix %q", retryEnv[:min(60, len(retryEnv))])
+	}
+}
+
+func TestLastFailureEnv(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		failure  failure
+		want     string
+		wantSubs []string
+	}{
+		{
+			name:    "reason only when there is no output",
+			failure: failure{Kind: failStall, Detail: "no output for 10m0s"},
+			want:    "stalled: no output for 10m0s",
+		},
+		{
+			name:     "reason and output",
+			failure:  failure{Kind: failPredicate, Detail: "predicate did not pass for lane L1", Output: "FAIL: nope"},
+			wantSubs: []string{"predicate failed: predicate did not pass for lane L1", "FAIL: nope"},
+		},
+		{
+			name:     "a deadline failure carries the log tail",
+			failure:  failure{Kind: failDeadline, Detail: "exceeded 90m0s", Output: "last line before the kill"},
+			wantSubs: []string{"deadline exceeded: exceeded 90m0s", "last line before the kill"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := lastFailureEnv(tc.failure)
+			if tc.want != "" && got != tc.want {
+				t.Errorf("lastFailureEnv() = %q, want %q", got, tc.want)
+			}
+			for _, want := range tc.wantSubs {
+				if !strings.Contains(got, want) {
+					t.Errorf("lastFailureEnv() = %q, want it to contain %q", got, want)
+				}
+			}
+		})
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}

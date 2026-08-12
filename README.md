@@ -222,17 +222,49 @@ Three things to know about `command` lanes:
   `kazi apply` lane that dispatches agents internally still spends that
   account's quota, so it has to be pinned and counted like any other lane, or
   the reserve floor protects nothing.
-- **A retry re-runs the command unchanged.** There is no prompt to append the
-  previous failure to. The failure is not lost — it is recorded in
-  `results.jsonl` with the predicate's output — but the command itself sees the
-  same arguments each attempt. A command that should react to the previous
-  attempt has to read the world, as `kazi apply` does.
+- **A retry passes the previous failure in the environment.** There is no
+  prompt to append it to, so it arrives as `SPRINTD_LAST_FAILURE` instead —
+  see below.
 - **Model is not required, and not used.** A command lane picks its own model,
   or has no concept of one.
 
 The predicate contract is identical either way: its own process, in the lane's
 worktree, with no account environment, and exit 0 is the only thing that counts
 as complete.
+
+#### What a lane's command is told
+
+Every dispatched command gets these, on top of the account pin:
+
+| Variable | Set when | Contains |
+|---|---|---|
+| `SPRINTD_ATTEMPT` | always | the 1-based attempt number |
+| `SPRINTD_LAST_FAILURE` | attempts after the first | why the previous attempt failed, and the predicate's output |
+
+`SPRINTD_LAST_FAILURE` is absent on the first attempt, so its presence is how a
+command tells a retry from a fresh run. Its contents are the same context a
+`prompt` lane gets appended to its prompt — the failure reason, then the
+predicate's combined output (or the log tail, for a stall or a deadline) —
+truncated to a bounded size, keeping the end, which is where the error is.
+
+A command that reads it gets full parity with a prompt lane:
+
+```sh
+#!/bin/bash
+# scripts/lane.sh
+if [ -n "${SPRINTD_LAST_FAILURE:-}" ]; then
+  echo "attempt ${SPRINTD_ATTEMPT}, previous failure:"
+  echo "$SPRINTD_LAST_FAILURE"
+fi
+exec kazi apply goals/cold-launch.toml
+```
+
+A command that ignores it re-runs identically, which is fine when the command
+already reads the world — `kazi apply` re-derives state from the repo every
+time, so it does not need to be told what failed. But without reading one or
+the other, a lane with `retries: 2` runs the same command three times for the
+same result, spending three deadlines, and the quota of any agents it dispatches,
+to reproduce a failure that was already known.
 
 A full annotated example is in [`examples/sprint.yaml`](examples/sprint.yaml).
 
