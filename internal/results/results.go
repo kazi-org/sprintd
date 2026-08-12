@@ -140,6 +140,42 @@ func Read(r io.Reader) ([]Record, error) {
 	return out, nil
 }
 
+// ReadTolerant decodes records like Read, except a malformed final line is
+// dropped instead of failing the whole read, and reported via truncated.
+//
+// This is the exact shape a process leaves behind when it is killed
+// mid-write: every earlier record was already flushed by its own Write call,
+// so at most the one in progress can be a partial line at EOF. A malformed
+// line anywhere else is real corruption, not a partial write, and still
+// fails the read.
+func ReadTolerant(r io.Reader) (out []Record, truncated bool, err error) {
+	var lines []string
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	for sc.Scan() {
+		text := strings.TrimSpace(sc.Text())
+		if text == "" {
+			continue
+		}
+		lines = append(lines, text)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, false, fmt.Errorf("reading results: %w", err)
+	}
+	out = make([]Record, 0, len(lines))
+	for i, text := range lines {
+		var rec Record
+		if unmarshalErr := json.Unmarshal([]byte(text), &rec); unmarshalErr != nil {
+			if i == len(lines)-1 {
+				return out, true, nil
+			}
+			return nil, false, fmt.Errorf("decoding results line %d: %w", i+1, unmarshalErr)
+		}
+		out = append(out, rec)
+	}
+	return out, false, nil
+}
+
 // LaneStatus is a lane's latest known state.
 type LaneStatus struct {
 	Lane     string

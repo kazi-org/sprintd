@@ -255,7 +255,7 @@ func Build(runDir string, now time.Time) (Report, error) {
 		return report, err
 	}
 
-	recs, hasEvents, err := readEvents(runDir)
+	recs, hasEvents, eventNotes, err := readEvents(runDir)
 	if err != nil {
 		return report, err
 	}
@@ -264,6 +264,7 @@ func Build(runDir string, now time.Time) (Report, error) {
 	}
 
 	report.Status, report.Notes = runStatus(manifest, hasManifest, recs, now)
+	report.Notes = append(report.Notes, eventNotes...)
 	report.Sprint = sprintInfo(manifest, hasManifest, recs, runDir, now)
 	report.Lanes = buildLanes(manifest, recs)
 	report.Totals = totals(report.Lanes)
@@ -276,15 +277,30 @@ func Build(runDir string, now time.Time) (Report, error) {
 	return report, nil
 }
 
-func readEvents(runDir string) ([]results.Record, bool, error) {
-	recs, err := results.Load(filepath.Join(runDir, results.FileName))
+// readEvents loads the event log, tolerating a truncated final line -- what
+// a process killed mid-write leaves behind. Every earlier record was already
+// flushed by its own Write call, so at most one trailing line can be
+// incomplete; that one is dropped rather than failing the whole read.
+func readEvents(runDir string) ([]results.Record, bool, []string, error) {
+	f, err := os.Open(filepath.Join(runDir, results.FileName))
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil, false, nil
+		return nil, false, nil, nil
 	}
 	if err != nil {
-		return nil, false, err
+		return nil, false, nil, fmt.Errorf("opening event log: %w", err)
 	}
-	return recs, true, nil
+	defer f.Close()
+
+	recs, truncated, err := results.ReadTolerant(f)
+	if err != nil {
+		return nil, false, nil, err
+	}
+	var notes []string
+	if truncated {
+		notes = append(notes, "the event log's last line was incomplete (the run was killed mid-write) "+
+			"and was dropped; every earlier event is intact")
+	}
+	return recs, true, notes, nil
 }
 
 // runStatus answers the question the whole payload exists for.
