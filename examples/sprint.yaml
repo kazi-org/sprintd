@@ -89,6 +89,18 @@ lanes:
     machine: builder
     deadline: 45m
 
+  # A lane can supply its own command instead of a prompt, for work that
+  # already owns its agent loop. sprintd then contributes only what that
+  # command has no concept of: which machine, which account, the deadline and
+  # the stall watchdog. The account pin still applies -- a command that
+  # dispatches agents internally spends that account's quota too.
+  - id: L4
+    repo: service
+    goal: "The payments suite stops flaking"
+    command: "kazi apply goals/payments-flake.toml"
+    predicate: "./scripts/payments-stable.sh"
+    machine: builder
+
   - id: L3
     repo: app
     goal: "The release build ships with the fixed launch path"

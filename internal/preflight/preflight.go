@@ -175,6 +175,19 @@ func checkMachine(ctx context.Context, s *sprint.Sprint, exec Executor, name str
 		report.Checks = append(report.Checks, checkRepoFreshness(ctx, exec, host, repo)...)
 	}
 
+	// A sprint whose lanes all declare their own command never has sprintd run
+	// claude, so holding the sprint up on a claude probe would fail it for a
+	// tool it does not use. The check still appears, so a reader can see it
+	// was considered rather than quietly dropped.
+	if !s.UsesClaude() {
+		report.Checks = append(report.Checks, Check{
+			Name:   "claude",
+			OK:     true,
+			Detail: "skipped: every lane declares its own command, so sprintd does not invoke claude",
+		})
+		return report
+	}
+
 	report.Checks = append(report.Checks, runCheck(ctx, exec, "claude --version",
 		machine.Command{Host: host, Script: "claude --version"}, ""))
 

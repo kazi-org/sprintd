@@ -129,10 +129,16 @@ func (r Repo) StaleLimit() int {
 // Lane is one deadline-bounded unit of agent work plus the predicate that
 // decides, from outside the lane, whether it actually landed.
 type Lane struct {
-	ID        string   `yaml:"id"`
-	Repo      string   `yaml:"repo"`
-	Goal      string   `yaml:"goal"`
-	Prompt    string   `yaml:"prompt"`
+	ID   string `yaml:"id"`
+	Repo string `yaml:"repo"`
+	Goal string `yaml:"goal"`
+	// Prompt is the text handed to claude -p. Mutually exclusive with Command.
+	Prompt string `yaml:"prompt"`
+	// Command, when set, is the lane's command verbatim, and Prompt and Model
+	// are not used. It exists so a lane can run something that owns its own
+	// agent loop -- kazi apply, a script, a build -- instead of sprintd
+	// composing a claude invocation for it.
+	Command   string   `yaml:"command"`
 	Predicate string   `yaml:"predicate"`
 	Machine   string   `yaml:"machine"`
 	Model     string   `yaml:"model"`
@@ -140,6 +146,10 @@ type Lane struct {
 	Retries   *int     `yaml:"retries"`
 	Needs     []string `yaml:"needs"`
 }
+
+// Composed reports whether sprintd builds this lane's command from a prompt,
+// rather than the sprint file supplying it.
+func (l Lane) Composed() bool { return strings.TrimSpace(l.Command) == "" }
 
 // Sprint is a whole sprint file.
 type Sprint struct {
@@ -348,8 +358,15 @@ func (s *Sprint) validateLanes() error {
 			return fmt.Errorf("%w: lane %s has no predicate; a lane whose completion "+
 				"cannot be observed by a separate process is not a lane", ErrInvalid, ln.ID)
 		}
-		if strings.TrimSpace(ln.Prompt) == "" {
-			return fmt.Errorf("%w: lane %s has an empty prompt", ErrInvalid, ln.ID)
+		hasPrompt := strings.TrimSpace(ln.Prompt) != ""
+		hasCommand := strings.TrimSpace(ln.Command) != ""
+		switch {
+		case hasPrompt && hasCommand:
+			return fmt.Errorf("%w: lane %s sets both prompt and command; it can have one or the other, "+
+				"since command replaces the claude invocation sprintd would compose", ErrInvalid, ln.ID)
+		case !hasPrompt && !hasCommand:
+			return fmt.Errorf("%w: lane %s has neither a prompt nor a command, so there is nothing to run",
+				ErrInvalid, ln.ID)
 		}
 		if strings.TrimSpace(ln.Goal) == "" {
 			return fmt.Errorf("%w: lane %s has an empty goal", ErrInvalid, ln.ID)
@@ -360,8 +377,12 @@ func (s *Sprint) validateLanes() error {
 		if _, ok := s.Machines[ln.Machine]; !ok {
 			return fmt.Errorf("%w: lane %s references unknown machine %q", ErrInvalid, ln.ID, ln.Machine)
 		}
-		if model := s.modelFor(ln); model == "" {
-			return fmt.Errorf("%w: lane %s has no model and defaults.model is unset", ErrInvalid, ln.ID)
+		// A model is only meaningful for a lane whose command sprintd composes.
+		// A command lane picks its own model, or has no concept of one.
+		if ln.Composed() {
+			if model := s.modelFor(ln); model == "" {
+				return fmt.Errorf("%w: lane %s has no model and defaults.model is unset", ErrInvalid, ln.ID)
+			}
 		}
 		if d := s.deadlineFor(ln); d <= 0 {
 			return fmt.Errorf("%w: lane %s has deadline %s, want a positive duration", ErrInvalid, ln.ID, d)
@@ -454,7 +475,9 @@ func (s *Sprint) ResolvedLanes() []ResolvedLane {
 			Attempts:      s.retriesFor(ln) + 1,
 			Timeout:       s.deadlineFor(ln),
 		}
-		resolved.Model = s.modelFor(ln)
+		if ln.Composed() {
+			resolved.Model = s.modelFor(ln)
+		}
 		out = append(out, resolved)
 	}
 	return out
@@ -466,6 +489,18 @@ type RepoTarget struct {
 	Path           string
 	Base           string
 	StaleThreshold int
+}
+
+// UsesClaude reports whether any lane has its claude invocation composed by
+// sprintd. When none do, sprintd never runs claude itself, and preflight has
+// no reason to hold up the sprint on a claude probe.
+func (s *Sprint) UsesClaude() bool {
+	for _, ln := range s.Lanes {
+		if ln.Composed() {
+			return true
+		}
+	}
+	return false
 }
 
 // MachineRepos maps each machine name to the repos lanes use on it.

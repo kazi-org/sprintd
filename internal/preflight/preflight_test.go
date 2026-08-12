@@ -424,3 +424,70 @@ func TestMissingRepoSkipsFreshnessChecks(t *testing.T) {
 		}
 	}
 }
+
+// TestClaudeProbeSkippedWhenNoLaneUsesIt keeps a sprint of purely
+// command-driven lanes from failing on an account probe for a tool it never
+// invokes.
+func TestClaudeProbeSkippedWhenNoLaneUsesIt(t *testing.T) {
+	t.Parallel()
+
+	src := strings.NewReplacer(
+		`prompt: p, predicate: "./check.sh", machine: mini }`, `command: "kazi apply goals/a.toml", predicate: "./check.sh", machine: mini }`,
+		`prompt: p, predicate: "./check.sh", machine: dgx }`, `command: "make verify", predicate: "./check.sh", machine: dgx }`,
+	).Replace(sprintFile)
+	s, err := sprint.Parse([]byte(src))
+	if err != nil {
+		t.Fatalf("parsing sprint: %v", err)
+	}
+	if s.UsesClaude() {
+		t.Fatal("fixture still has a claude-composed lane")
+	}
+
+	// Every claude invocation fails; the sprint should still be ready.
+	exec := &scriptedExec{rules: []rule{
+		{match: "claude", exit: 127, output: "bash: claude: command not found"},
+	}}
+	reports := preflight.Run(context.Background(), s, exec, preflight.Options{})
+	if !preflight.AllOK(reports) {
+		t.Fatalf("AllOK() = false, want true; reports = %+v", reports)
+	}
+	for _, script := range exec.scripts() {
+		if strings.Contains(script, "claude") {
+			t.Errorf("probed claude for a sprint that never runs it: %q", script)
+		}
+	}
+	var noted bool
+	for _, r := range reports {
+		for _, c := range r.Checks {
+			if c.Name == "claude" && strings.Contains(c.Detail, "skipped") {
+				noted = true
+			}
+		}
+	}
+	if !noted {
+		t.Error("the skip was not reported; it must be visible, not silently dropped")
+	}
+}
+
+// TestClaudeProbeRunsWhenAnyLaneUsesIt is the other half: one composed lane is
+// enough to make the probe blocking again.
+func TestClaudeProbeRunsWhenAnyLaneUsesIt(t *testing.T) {
+	t.Parallel()
+
+	src := strings.Replace(sprintFile,
+		`prompt: p, predicate: "./check.sh", machine: mini }`,
+		`command: "kazi apply goals/a.toml", predicate: "./check.sh", machine: mini }`, 1)
+	s, err := sprint.Parse([]byte(src))
+	if err != nil {
+		t.Fatalf("parsing sprint: %v", err)
+	}
+	if !s.UsesClaude() {
+		t.Fatal("fixture should still have one claude-composed lane")
+	}
+	exec := &scriptedExec{rules: []rule{
+		{match: "claude", exit: 127, output: "bash: claude: command not found"},
+	}}
+	if preflight.AllOK(preflight.Run(context.Background(), s, exec, preflight.Options{})) {
+		t.Error("AllOK() = true, want false: a lane still needs claude and it is missing")
+	}
+}

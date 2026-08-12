@@ -382,7 +382,11 @@ func (r *Runner) runLane(ctx context.Context, ln sprint.ResolvedLane) laneState 
 			Machine: ln.Machine, Account: account, Model: ln.Model,
 			Reason: fmt.Sprintf("retrying after %s", last),
 		})
-		prompt = retryPrompt(ln.Prompt, attempt, last)
+		if ln.Composed() {
+			// A verbatim command has nowhere to put the failure context, so it
+			// is re-run unchanged; the failure is still in results.jsonl.
+			prompt = retryPrompt(ln.Prompt, attempt, last)
+		}
 	}
 
 	r.record(results.Record{
@@ -428,6 +432,20 @@ func (r *Runner) recordFailure(ln sprint.ResolvedLane, attempt int, account, wor
 	}
 }
 
+// laneScript is the command line for one attempt.
+//
+// A lane that declares a command runs it verbatim; sprintd supplies only what
+// that command has no concept of -- which machine, which account, the deadline
+// and the watchdog. Otherwise sprintd composes the claude invocation, which is
+// the original prompt on the first attempt and the prompt plus the previous
+// failure on a retry.
+func laneScript(ln sprint.ResolvedLane, prompt string) string {
+	if !ln.Composed() {
+		return ln.Command
+	}
+	return fmt.Sprintf("claude -p %s --model %s", machine.Quote(prompt), machine.Quote(ln.Model))
+}
+
 // attemptOutcome is the result of a single dispatch plus its verification.
 type attemptOutcome struct {
 	complete        bool
@@ -456,10 +474,9 @@ func (r *Runner) attempt(ctx context.Context, ln sprint.ResolvedLane, attempt in
 	cmd := machine.Command{
 		Host: ln.Host,
 		// The lane's own worktree, never the primary checkout.
-		Dir: worktree,
-		Env: env,
-		Script: fmt.Sprintf("claude -p %s --model %s",
-			machine.Quote(prompt), machine.Quote(ln.Model)),
+		Dir:    worktree,
+		Env:    env,
+		Script: laneScript(ln, prompt),
 	}
 
 	// The deadline and the stall watchdog cancel the same context with
