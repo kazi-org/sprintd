@@ -106,9 +106,25 @@ func TestParseRejects(t *testing.T) {
 			wantSub: "lane L1 has no predicate",
 		},
 		{
-			name:    "lane with an empty prompt",
+			name:    "lane with neither a prompt nor a command",
 			mutate:  func(s string) string { return strings.Replace(s, `prompt: "make the thing go away"`, `prompt: ""`, 1) },
-			wantSub: "lane L1 has an empty prompt",
+			wantSub: "lane L1 has neither a prompt nor a command",
+		},
+		{
+			name: "lane with both a prompt and a command",
+			mutate: func(s string) string {
+				return strings.Replace(s, `    prompt: "make the thing go away"`,
+					"    prompt: \"make the thing go away\"\n    command: \"kazi apply goals/x.toml\"", 1)
+			},
+			wantSub: "lane L1 sets both prompt and command",
+		},
+		{
+			name: "command lane still needs a predicate",
+			mutate: func(s string) string {
+				s = strings.Replace(s, `    prompt: "make the thing go away"`, `    command: "kazi apply goals/x.toml"`, 1)
+				return strings.Replace(s, `    predicate: "./check.sh"`+"\n", "", 1)
+			},
+			wantSub: "lane L1 has no predicate",
 		},
 		{
 			name:    "lane with an empty goal",
@@ -353,6 +369,89 @@ func TestRepoBaseAndStaleDefaults(t *testing.T) {
 			}
 			if got := s.ResolvedLanes()[0].Base; got != tc.wantBase {
 				t.Errorf("resolved lane base = %q, want %q", got, tc.wantBase)
+			}
+		})
+	}
+}
+
+// TestCommandLane covers the lane shape that runs something owning its own
+// agent loop, where sprintd supplies only machine, account, deadline and
+// watchdog.
+func TestCommandLane(t *testing.T) {
+	t.Parallel()
+
+	src := strings.Replace(validSprint, `    prompt: "make the thing go away"`,
+		`    command: "kazi apply goals/faceid.toml"`, 1)
+	s, err := sprint.Parse([]byte(src))
+	if err != nil {
+		t.Fatalf("Parse() error = %v, want nil", err)
+	}
+	lanes := s.ResolvedLanes()
+	if lanes[0].Composed() {
+		t.Error("L1 Composed() = true, want false for a lane declaring its own command")
+	}
+	if got, want := lanes[0].Command, "kazi apply goals/faceid.toml"; got != want {
+		t.Errorf("Command = %q, want %q", got, want)
+	}
+	if lanes[0].Model != "" {
+		t.Errorf("Model = %q, want empty: a command lane picks its own model", lanes[0].Model)
+	}
+	if !lanes[1].Composed() {
+		t.Error("L2 Composed() = false, want true: it still uses a prompt")
+	}
+	if lanes[1].Model != "opus" {
+		t.Errorf("L2 Model = %q, want opus", lanes[1].Model)
+	}
+}
+
+// TestCommandLaneNeedsNoModel pins that a sprint of only command lanes parses
+// with no model declared anywhere.
+func TestCommandLaneNeedsNoModel(t *testing.T) {
+	t.Parallel()
+
+	src := validSprint
+	src = strings.Replace(src, `    prompt: "make the thing go away"`, `    command: "kazi apply goals/a.toml"`, 1)
+	src = strings.Replace(src, `    prompt: "do the other thing"`, `    command: "make verify"`, 1)
+	src = strings.Replace(src, "    model: opus\n", "", 1)
+	src = strings.Replace(src, "  model: sonnet\n", "", 1)
+
+	s, err := sprint.Parse([]byte(src))
+	if err != nil {
+		t.Fatalf("Parse() error = %v, want nil", err)
+	}
+	if s.UsesClaude() {
+		t.Error("UsesClaude() = true, want false when no lane has its command composed")
+	}
+}
+
+func TestUsesClaude(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		swaps []string
+		want  bool
+	}{
+		{name: "all prompt lanes", want: true},
+		{
+			name:  "one command lane and one prompt lane",
+			swaps: []string{`    prompt: "make the thing go away"`, `    command: "make verify"`},
+			want:  true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			src := validSprint
+			for i := 0; i+1 < len(tc.swaps); i += 2 {
+				src = strings.Replace(src, tc.swaps[i], tc.swaps[i+1], 1)
+			}
+			s, err := sprint.Parse([]byte(src))
+			if err != nil {
+				t.Fatalf("Parse() error = %v, want nil", err)
+			}
+			if got := s.UsesClaude(); got != tc.want {
+				t.Errorf("UsesClaude() = %v, want %v", got, tc.want)
 			}
 		})
 	}

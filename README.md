@@ -77,9 +77,14 @@ Checks every machine any lane targets, in parallel, inside a per-machine budget
    failure rather than a hang),
 2. each repo path exists and is a git checkout,
 3. `git fetch` works there, and the checkout is actually usable — see below,
-4. `claude --version` runs,
-5. a trivial `claude -p` returns the expected string — once per account that
-   has its own `config_dir`, since that is what separates credentials.
+5. `claude --version` runs and a trivial `claude -p` returns the expected
+   string — once per account that has its own `config_dir`, since that is what
+   separates credentials.
+
+Steps 4 and 5 are skipped, visibly, for a sprint whose lanes all declare
+`command`: sprintd never invokes claude for such a sprint, and failing it on an
+account probe for a tool it does not use would be wrong. One `prompt` lane
+anywhere makes them blocking again.
 
 Step 5 is graded on the output, not just the exit status. An agent that exits
 `0` and says nothing is the locked-keychain shape, and it is exactly what
@@ -167,7 +172,67 @@ lanes:
     deadline: 90m                     # optional; overrides defaults
     retries: 1                        # optional; overrides defaults
     needs: [L0]                       # lanes that must complete first
+
+  - id: L2
+    repo: app
+    goal: "the flake in the payments suite is gone"
+    command: "kazi apply goals/payments-flake.toml"   # instead of prompt
+    predicate: "./scripts/payments-stable.sh"
+    machine: mini
 ```
+
+### `prompt` or `command`
+
+A lane says **either** what to prompt an agent with, or what command to run.
+
+| Field | sprintd runs |
+|---|---|
+| `prompt` | `claude -p '<prompt>' --model <model>` |
+| `command` | your command, verbatim |
+
+A lane must have exactly one of them. Both, or neither, is rejected at parse
+time by lane id — the same discipline as a missing predicate.
+
+`command` exists so a lane can run something that owns its own agent loop
+rather than having sprintd compose one. The motivating case is
+[kazi](https://github.com/kazi-org/kazi), a reconciliation controller that
+already grinds until its own predicates hold:
+
+```yaml
+  - id: L3
+    repo: app
+    goal: "the cold-launch check passes"
+    command: "kazi apply goals/cold-launch.toml"
+    predicate: "./scripts/cold-launch-check.sh"
+    machine: mini
+```
+
+For converge-shaped work, sprintd's retry loop and kazi's reconciliation loop
+are the same loop. Running the lane as `kazi apply` lets kazi own convergence,
+and leaves sprintd supplying only what kazi has no concept of: **which machine,
+which account, the deadline, and the liveness watchdog**. The two stay separate
+tools rather than merging, because kazi's model — guards, held-out predicates,
+drift detection, convergence vectors — is far more than a one-off lane needs,
+and forcing that schema onto every lane would be the bad-abstraction case.
+
+Three things to know about `command` lanes:
+
+- **Account pinning still applies.** `CLAUDE_CONFIG_DIR` is set for the lane's
+  assigned account whatever the command is. This matters and is not obvious: a
+  `kazi apply` lane that dispatches agents internally still spends that
+  account's quota, so it has to be pinned and counted like any other lane, or
+  the reserve floor protects nothing.
+- **A retry re-runs the command unchanged.** There is no prompt to append the
+  previous failure to. The failure is not lost — it is recorded in
+  `results.jsonl` with the predicate's output — but the command itself sees the
+  same arguments each attempt. A command that should react to the previous
+  attempt has to read the world, as `kazi apply` does.
+- **Model is not required, and not used.** A command lane picks its own model,
+  or has no concept of one.
+
+The predicate contract is identical either way: its own process, in the lane's
+worktree, with no account environment, and exit 0 is the only thing that counts
+as complete.
 
 A full annotated example is in [`examples/sprint.yaml`](examples/sprint.yaml).
 
@@ -178,8 +243,9 @@ only thing that makes the lane real.
 
 ### Validation
 
-The sprint is rejected, naming the lane, if any lane has no predicate, no
-prompt, no goal, an unknown repo or machine, an unknown or self-referential
+The sprint is rejected, naming the lane, if any lane has no predicate, no goal,
+neither a prompt nor a command, both a prompt and a command, an unknown repo or
+machine, an unknown or self-referential
 `needs`, a duplicate id, or no resolvable model or deadline. `needs` cycles are
 rejected too, as is a repo with a `max_concurrent` below 1 or a negative
 `stale_threshold`, an account with a `reserve_floor_pct` outside 0–100, and two
@@ -306,17 +372,25 @@ tolerance, guards against a lane satisfying the letter of a check, or a loop
 that converges rather than a one-shot verdict. sprintd deliberately does not
 grow those; it stays a scheduler with a one-command contract.
 
-Point the predicate at something that does. Because a predicate is just a
-command, a lane can invoke [kazi](https://github.com/kazi-org/kazi), a
-reconciliation controller built around exactly that problem, with no change to
-either tool:
+Point at something that does. [kazi](https://github.com/kazi-org/kazi) is a
+reconciliation controller built around exactly that problem, and a lane can use
+it from either side with no change to either tool:
 
 ```yaml
-predicate: "kazi status --goal faceid-cold-launch --exit-code"
+# kazi does the work and owns convergence; sprintd supplies the machine, the
+# account, the deadline and the watchdog.
+command: "kazi apply goals/cold-launch.toml"
+predicate: "./scripts/cold-launch-check.sh"
 ```
 
-sprintd still decides completion the same way — by that command's exit status,
-observed from outside the lane.
+```yaml
+# or: an ordinary prompt lane, with kazi asked for the verdict.
+prompt: "…"
+predicate: "kazi status --goal cold-launch --exit-code"
+```
+
+Either way sprintd decides completion the same way — by the predicate's exit
+status, observed from outside the lane.
 
 ## Account allocation
 

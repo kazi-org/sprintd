@@ -59,7 +59,10 @@ func (f *fakeExec) Run(ctx context.Context, cmd machine.Command, out io.Writer) 
 		return machine.Result{ExitCode: 0}, nil
 	}
 
-	isPredicate := !strings.HasPrefix(cmd.Script, "claude -p ")
+	// Classify on the fixture's predicate shape rather than on the dispatch
+	// shape: a lane that supplies its own command does not start with
+	// "claude -p", and keying off that would file it as a predicate.
+	isPredicate := strings.HasPrefix(cmd.Script, "verify ")
 	c := call{Script: cmd.Script, Env: cmd.Env, Predicate: isPredicate, Dir: cmd.Dir}
 	c.Lane = laneFromScript(cmd.Script)
 
@@ -161,6 +164,17 @@ lanes:
 		t.Fatalf("building fixture sprint: %v", err)
 	}
 	return s
+}
+
+// commandLane is a lane that supplies its own command instead of a prompt.
+func commandLane(id, command string) string {
+	return fmt.Sprintf(`  - id: %s
+    repo: app
+    goal: "goal lane=%s"
+    command: "%s"
+    predicate: "verify lane=%s"
+    machine: mini
+`, id, id, command, id)
 }
 
 func lane(id string, extra ...string) string {
@@ -910,4 +924,156 @@ func keys(m map[string]bool) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// TestComposedLaneScriptIsUnchanged is the regression guard for the command
+// field: a lane that supplies a prompt must still produce byte-for-byte the
+// claude invocation it produced before the field existed.
+func TestComposedLaneScriptIsUnchanged(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		prompt string
+		model  string
+		want   string
+	}{
+		{
+			name:   "plain prompt",
+			prompt: "fix the thing",
+			model:  "sonnet",
+			want:   `claude -p 'fix the thing' --model 'sonnet'`,
+		},
+		{
+			name:   "prompt containing a quote",
+			prompt: "it's broken",
+			model:  "opus",
+			want:   `claude -p 'it'\''s broken' --model 'opus'`,
+		},
+		{
+			name:   "prompt containing shell metacharacters stays inert",
+			prompt: "$(rm -rf /) `whoami`",
+			model:  "sonnet",
+			want:   "claude -p '$(rm -rf /) `whoami`' --model 'sonnet'",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ln := sprint.ResolvedLane{Lane: sprint.Lane{Prompt: tc.prompt}}
+			ln.Model = tc.model
+			if got := laneScript(ln, tc.prompt); got != tc.want {
+				t.Errorf("laneScript() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCommandLaneScriptIsVerbatim(t *testing.T) {
+	t.Parallel()
+
+	ln := sprint.ResolvedLane{Lane: sprint.Lane{Command: "kazi apply goals/faceid.toml --max-iterations 20"}}
+	// The prompt argument is what a retry would have composed; a command lane
+	// must ignore it entirely.
+	if got, want := laneScript(ln, "some retry prompt"), "kazi apply goals/faceid.toml --max-iterations 20"; got != want {
+		t.Errorf("laneScript() = %q, want the command verbatim %q", got, want)
+	}
+}
+
+// TestCommandLaneDispatchesAndIsVerified runs the whole path for a lane that
+// supplies its own command.
+func TestCommandLaneDispatchesAndIsVerified(t *testing.T) {
+	t.Parallel()
+
+	exec := newFakeExec(func(_ context.Context, c call, _ int, out io.Writer) (machine.Result, error) {
+		fmt.Fprintln(out, "ok")
+		return machine.Result{ExitCode: 0}, nil
+	})
+	s := fixture(t, commandLane("L1", "kazi apply goals/lane=L1.toml"))
+	h := newHarness(t, s, exec, nil)
+
+	sum, err := h.runner.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	if len(sum.Complete) != 1 || sum.Complete[0] != "L1" {
+		t.Fatalf("Complete = %v, want [L1]", sum.Complete)
+	}
+
+	var dispatched, verified bool
+	for _, c := range exec.snapshot() {
+		switch {
+		case c.Setup:
+		case strings.HasPrefix(c.Script, "kazi apply"):
+			dispatched = true
+			if strings.Contains(c.Script, "claude") {
+				t.Errorf("command lane script was wrapped: %q", c.Script)
+			}
+			// Account pinning must still apply: a command that dispatches
+			// agents internally spends that account's quota.
+			if got := c.Env["CLAUDE_CONFIG_DIR"]; got != "/tmp/primary" {
+				t.Errorf("command lane CLAUDE_CONFIG_DIR = %q, want /tmp/primary", got)
+			}
+		case c.Predicate:
+			verified = true
+			if _, ok := c.Env["CLAUDE_CONFIG_DIR"]; ok {
+				t.Error("predicate was given account credentials")
+			}
+		}
+	}
+	if !dispatched {
+		t.Error("the lane's own command never ran")
+	}
+	if !verified {
+		t.Error("the predicate never ran")
+	}
+}
+
+// TestCommandLaneRetriesVerbatim pins the consequence of a verbatim command:
+// there is nowhere to append the previous failure, so it is re-run unchanged
+// and the failure lives in the results log instead.
+func TestCommandLaneRetriesVerbatim(t *testing.T) {
+	t.Parallel()
+
+	exec := newFakeExec(func(_ context.Context, c call, attempt int, out io.Writer) (machine.Result, error) {
+		if c.Predicate {
+			if attempt == 1 {
+				fmt.Fprintln(out, "FAIL: not converged yet")
+				return machine.Result{ExitCode: 1}, nil
+			}
+			fmt.Fprintln(out, "OK")
+			return machine.Result{ExitCode: 0}, nil
+		}
+		fmt.Fprintln(out, "grinding")
+		return machine.Result{ExitCode: 0}, nil
+	})
+	s := fixture(t, commandLane("L1", "kazi apply goals/lane=L1.toml"))
+	h := newHarness(t, s, exec, nil)
+	if _, err := h.runner.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+
+	var dispatches []string
+	for _, c := range exec.snapshot() {
+		if !c.Setup && !c.Predicate {
+			dispatches = append(dispatches, c.Script)
+		}
+	}
+	if len(dispatches) != 2 {
+		t.Fatalf("dispatches = %d, want 2", len(dispatches))
+	}
+	if dispatches[0] != dispatches[1] {
+		t.Errorf("retry changed the command:\n first: %q\nsecond: %q", dispatches[0], dispatches[1])
+	}
+	// The failure is not lost, it just lives in the record rather than the
+	// command.
+	var sawPredicateFailure bool
+	for _, rec := range h.recorder.records(t) {
+		if rec.State == results.StatePredicateFailed && strings.Contains(rec.PredicateOutput, "not converged yet") {
+			sawPredicateFailure = true
+		}
+	}
+	if !sawPredicateFailure {
+		t.Error("the predicate failure was not preserved in results.jsonl")
+	}
 }
